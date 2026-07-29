@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>拖拉机 - 单机升级游戏</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="game-container">
+        <!-- 顶部信息栏 -->
+        <div class="top-bar">
+            <div class="game-title">🃏 拖拉机</div>
+            <div class="game-info">
+                <span id="current-level">当前打: 2</span>
+                <span id="trump-suit">主花色: 无</span>
+                <span id="current-dealer">庄家: --</span>
+                <span id="score-info">得分: 0 / 200</span>
+            </div>
+            <div class="score-board">
+                <div class="team-score" id="team-a">我方: 2</div>
+                <div class="vs">VS</div>
+                <div class="team-score" id="team-b">对方: 2</div>
+            </div>
+        </div>
+
+        <!-- 游戏主区域 -->
+        <div class="game-table">
+            <!-- 左侧玩家 -->
+            <div class="player-position left-player" id="player-left">
+                <div class="player-info">
+                    <div class="player-avatar">🤖</div>
+                    <div class="player-name">AI-左</div>
+                    <div class="player-role">对手</div>
+                </div>
+                <div class="card-count" id="left-card-count">25张</div>
+            </div>
+
+            <!-- 顶部玩家 -->
+            <div class="player-position top-player" id="player-top">
+                <div class="player-info">
+                    <div class="player-avatar">🤖</div>
+                    <div class="player-name">AI-上</div>
+                    <div class="player-role">队友</div>
+                </div>
+                <div class="card-count" id="top-card-count">25张</div>
+            </div>
+
+            <!-- 右侧玩家 -->
+            <div class="player-position right-player" id="player-right">
+                <div class="player-info">
+                    <div class="player-avatar">🤖</div>
+                    <div class="player-name">AI-右</div>
+                    <div class="player-role">对手</div>
+                </div>
+                <div class="card-count" id="right-card-count">25张</div>
+            </div>
+
+            <!-- 中央出牌区域 -->
+            <div class="play-area" id="play-area">
+                <div class="play-slot left-play" id="play-left"></div>
+                <div class="play-slot top-play" id="play-top"></div>
+                <div class="play-slot right-play" id="play-right"></div>
+                <div class="play-slot bottom-play" id="play-bottom"></div>
+                <div class="trick-winner" id="trick-winner"></div>
+            </div>
+
+            <!-- 牌堆和底牌 -->
+            <div class="deck-area" id="deck-area">
+                <div class="deck" id="deck">
+                    <div class="deck-count" id="deck-count">8</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部玩家区域 -->
+        <div class="bottom-area">
+            <div class="player-info human-player-info">
+                <div class="player-avatar">😊</div>
+                <div class="player-name">你</div>
+                <div class="player-role" id="human-role">庄家</div>
+            </div>
+            <div class="hand-area" id="hand-area">
+                <!-- 玩家手牌将在这里动态生成 -->
+            </div>
+            <div class="action-buttons" id="action-buttons">
+                <!-- 动态生成的按钮 -->
+            </div>
+        </div>
+
+        <!-- 游戏日志 -->
+        <div class="game-log" id="game-log">
+            <div class="log-title">游戏记录</div>
+            <div class="log-content" id="log-content"></div>
+        </div>
+    </div>
+
+    <!-- 叫主弹窗 -->
+    <div class="modal" id="bid-modal">
+        <div class="modal-content">
+            <h3>叫主</h3>
+            <p>请选择要亮的主牌：</p>
+            <div class="bid-options" id="bid-options">
+                <!-- 动态生成 -->
+            </div>
+            <div class="modal-buttons">
+                <button class="btn btn-secondary" id="pass-bid">跳过</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 埋底弹窗 -->
+    <div class="modal" id="bury-modal">
+        <div class="modal-content">
+            <h3>埋底牌</h3>
+            <p>请选择8张牌作为底牌：</p>
+            <div class="bury-area" id="bury-area"></div>
+            <div class="bury-selected" id="bury-selected">已选: 0/8</div>
+            <div class="modal-buttons">
+                <button class="btn btn-primary" id="confirm-bury" disabled>确认埋底</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 游戏结束弹窗 -->
+    <div class="modal" id="gameover-modal">
+        <div class="modal-content">
+            <h3 id="gameover-title">本局结束</h3>
+            <div id="gameover-result"></div>
+            <div class="modal-buttons">
+                <button class="btn btn-primary" id="next-game">下一局</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 游戏开始画面 -->
+    <div class="start-screen" id="start-screen">
+        <div class="start-content">
+            <h1>🃏 拖拉机</h1>
+            <p>单机升级游戏</p>
+            <div class="rules-summary">
+                <h4>游戏规则</h4>
+                <ul>
+                    <li>4人对战，你和上方AI是队友</li>
+                    <li>使用2副牌，共108张</li>
+                    <li>5、10、K为分牌，共200分</li>
+                    <li>闲家抓够80分即可上台</li>
+                    <li>从2打起，先过A者获胜</li>
+                </ul>
+            </div>
+            <button class="btn btn-primary btn-large" id="start-game">开始游戏</button>
+        </div>
+    </div>
+
+    <script src="js/game.js"></script>
+    <script src="js/ai.js"></script>
+    <script src="js/ui.js"></script>
+</body>
+</html>
