@@ -893,7 +893,7 @@ function processPlay(order, index) {
             const cards = ai.decidePlay(game.players[player], game, game.currentTrick);
             
             // 验证出牌
-            if (!isValidPlay(game.players[player], cards, game.currentTrick, game.trumpSuit, game.level)) {
+            if (!isValidPlay(game.players[player], cards, game.currentTrick, game.trumpSuit, game.level, game.playedCardsHistory)) {
                 // AI出错了，强制出合法的牌
                 const forcedCards = forceValidPlay(game.players[player], game.currentTrick, game.trumpSuit, game.level);
                 log(`AI出牌错误，强制纠错`);
@@ -945,7 +945,7 @@ function onHumanPlay() {
     if (!isHumanTurn || selectedCards.length === 0) return;
     
     // 验证出牌
-    if (!isValidPlay(game.players.bottom, selectedCards, game.currentTrick, game.trumpSuit, game.level)) {
+    if (!isValidPlay(game.players.bottom, selectedCards, game.currentTrick, game.trumpSuit, game.level, game.playedCardsHistory)) {
         log('出牌不合法，请重新选择');
         return;
     }
@@ -1023,7 +1023,18 @@ function endRound() {
     
     log(`======== 本局结束 ========`);
     log(`庄家方(${dealerTeamName})得分: ${result.dealerScore}`);
-    log(`闲家方(${attackerTeamName})得分: ${result.attackerScore} (含底牌${result.kittyScore}分)`);
+    
+    // 显示抠底信息
+    if (result.kittyScore > 0) {
+        if (result.attackerWonLastTrick && result.kittyMultiplier > 1) {
+            const patternName = result.kittyMultiplier === 8 ? '拖拉机' : result.kittyMultiplier === 4 ? '对子' : '单张';
+            log(`闲家方(${attackerTeamName})得分: ${result.attackerScore} (底牌${result.kittyScore}分 × ${result.kittyMultiplier}倍 ${patternName}抠底 = ${result.kittyFinalScore}分)`);
+        } else {
+            log(`闲家方(${attackerTeamName})得分: ${result.attackerScore} (含底牌${result.kittyScore}分)`);
+        }
+    } else {
+        log(`闲家方(${attackerTeamName})得分: ${result.attackerScore}`);
+    }
     
     if (result.attackerScore >= 80) {
         log(`闲家上台！升 ${result.upgrade} 级`);
@@ -1044,10 +1055,18 @@ function showGameOverModal(result) {
     
     if (result.attackerScore >= 80) {
         title = '闲家获胜！';
+        let kittyInfo = '';
+        if (result.kittyScore > 0 && result.attackerWonLastTrick && result.kittyMultiplier > 1) {
+            const patternName = result.kittyMultiplier === 8 ? '拖拉机' : result.kittyMultiplier === 4 ? '对子' : '单张';
+            kittyInfo = `<p>底牌抠底: <span>${result.kittyScore}分 × ${result.kittyMultiplier}倍（${patternName}）= ${result.kittyFinalScore}分</span></p>`;
+        } else if (result.kittyScore > 0) {
+            kittyInfo = `<p>底牌分数: <span>${result.kittyScore}分</span></p>`;
+        }
         detail = `
             <div class="result-detail">
                 <p>闲家方(${attackerTeamName})成功上台！</p>
-                <p>闲家得分: <span>${result.attackerScore}</span> (含底牌${result.kittyScore}分)</p>
+                <p>闲家得分: <span>${result.attackerScore}</span></p>
+                ${kittyInfo}
                 <p>庄家得分: <span>${result.dealerScore}</span></p>
                 <p>升级: <span>${result.upgrade}</span> 级</p>
                 <p>我方当前级别: <span>${game.teamLevels.teamA}</span></p>
@@ -1056,11 +1075,16 @@ function showGameOverModal(result) {
         `;
     } else {
         title = '庄家守庄成功！';
+        let kittyInfo = '';
+        if (result.kittyScore > 0) {
+            kittyInfo = `<p>底牌分数: <span>${result.kittyScore}分（安全收回）</span></p>`;
+        }
         detail = `
             <div class="result-detail">
                 <p>庄家方(${dealerTeamName})成功守庄！</p>
                 <p>闲家得分: <span>${result.attackerScore}</span></p>
-                <p>庄家得分: <span>${result.dealerScore}</span> (含底牌${result.kittyScore}分)</p>
+                <p>庄家得分: <span>${result.dealerScore}</span></p>
+                ${kittyInfo}
                 <p>升级: <span>${result.upgrade}</span> 级</p>
                 <p>我方当前级别: <span>${game.teamLevels.teamA}</span></p>
                 <p>对方当前级别: <span>${game.teamLevels.teamB}</span></p>
@@ -1100,6 +1124,7 @@ function nextGame() {
 
 // 强制出合法牌（AI出错时的回退）
 function forceValidPlay(hand, trickCards, trumpSuit, level) {
+    const playedCardsHistory = game.playedCardsHistory || [];
     // 首家出牌：出最小的单张
     if (trickCards.length === 0) {
         const sorted = [...hand].sort((a, b) => getCardValue(a, trumpSuit, level) - getCardValue(b, trumpSuit, level));
@@ -1107,7 +1132,7 @@ function forceValidPlay(hand, trickCards, trumpSuit, level) {
     }
 
     const leadCards = trickCards[0].cards;
-    const leadPattern = getCardPattern(leadCards, trumpSuit, level);
+    const leadPattern = getCardPattern(leadCards, trumpSuit, level, playedCardsHistory);
     const leadSuit = getLeadSuit(leadCards, trumpSuit, level);
     const needLen = leadPattern.length;
 
@@ -1161,24 +1186,36 @@ function forceValidPlay(hand, trickCards, trumpSuit, level) {
             return leadSuitCards.slice(0, Math.min(2, leadSuitCards.length));
         }
 
-        // 拖拉机跟牌：优先出对子
+        // 拖拉机跟牌：拖拉机→2对子→1对子+单牌→全单牌
         if (leadPattern.type === 'tractor' && leadSuitCards.length >= 2) {
+            const tractors = findTractorsInCards(leadSuitCards, trumpSuit, level);
             const pairs = findPairsInCards(leadSuitCards, trumpSuit, level);
-            const result = [];
-            if (pairs.length > 0) {
-                // 先出对子
+
+            // 1. 有拖拉机，出拖拉机
+            if (tractors.length > 0) {
+                return tractors[0].slice(0, needLen);
+            }
+            // 2. 有2+对子，出对子
+            if (pairs.length >= 2) {
+                const result = [];
                 for (const pair of pairs) {
                     result.push(...pair);
                     if (result.length >= needLen) break;
                 }
+                return result.slice(0, needLen);
             }
-            // 不够的用单张补
-            const used = new Set(result.map(c => c.id));
-            const remaining = leadSuitCards.filter(c => !used.has(c.id));
-            while (result.length < needLen && remaining.length > 0) {
-                result.push(remaining.shift());
+            // 3. 有1个对子，出对子+单牌
+            if (pairs.length === 1) {
+                const result = [...pairs[0]];
+                const used = new Set(result.map(c => c.id));
+                const remaining = leadSuitCards.filter(c => !used.has(c.id));
+                while (result.length < needLen && remaining.length > 0) {
+                    result.push(remaining.shift());
+                }
+                return result.slice(0, needLen);
             }
-            return result.slice(0, needLen);
+            // 4. 没有对子，出单牌
+            return leadSuitCards.slice(0, needLen);
         }
 
         // 单张跟牌
@@ -1197,17 +1234,18 @@ function forceValidPlay(hand, trickCards, trumpSuit, level) {
         return result;
     }
 
-    // === 没有首家花色 → 可以垫牌或杀主 ===
-    // 尝试用主牌杀（如果主牌足够且是同型）
+    // === 没有首家花色 → 断门，可以垫牌或用主牌杀（杀必须同型）===
     const trumps = [...hand].filter(c => isTrump(c, trumpSuit, level))
         .sort((a, b) => getCardValue(a, trumpSuit, level) - getCardValue(b, trumpSuit, level));
 
+    // 杀对子：必须有主牌对子才能杀，否则只能垫牌
     if (leadPattern.type === 'pair' && trumps.length >= needLen) {
         const pairs = findPairsInCards(trumps, trumpSuit, level);
         if (pairs.length > 0) return pairs[0];
-        return trumps.slice(0, needLen);
+        // 没有主牌对子，不能杀 → 垫副牌
     }
 
+    // 杀拖拉机：必须有主牌拖拉机才能杀
     if (leadPattern.type === 'tractor' && trumps.length >= needLen) {
         const pairs = findPairsInCards(trumps, trumpSuit, level);
         if (pairs.length >= needLen / 2) {
@@ -1215,14 +1253,20 @@ function forceValidPlay(hand, trickCards, trumpSuit, level) {
             for (let i = 0; i < needLen / 2; i++) result.push(...pairs[i]);
             return result;
         }
+        // 没有主牌拖拉机，不能杀 → 垫副牌
     }
 
-    // 垫最小的副牌（不要分牌优先）
+    // 单张可以直接用主牌杀
+    if (leadPattern.type === 'single' && trumps.length >= needLen) {
+        return [trumps[0]];
+    }
+
+    // 垫牌：优先垫最小的副牌（非分牌优先）
     const nonTrumps = [...hand].filter(c => !isTrump(c, trumpSuit, level))
         .sort((a, b) => getCardValue(a, trumpSuit, level) - getCardValue(b, trumpSuit, level));
     if (nonTrumps.length >= needLen) return nonTrumps.slice(0, needLen);
 
-    // 副牌不够，用主牌补
+    // 副牌不够，用主牌补（垫牌，非杀主）
     const result = [...nonTrumps];
     while (result.length < needLen && trumps.length > 0) {
         result.push(trumps.shift());
