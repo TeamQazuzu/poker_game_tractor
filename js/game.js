@@ -831,12 +831,24 @@ function getTrickWinner(trickCards, trumpSuit, level, playedCardsHistory) {
     
     for (let i = 1; i < trickCards.length; i++) {
         const cards = trickCards[i].cards;
-        const card = cards[0]; // 对于对子和拖拉机，比较第一张即可（因为同型）
         
+        // 修复：首家出对子/拖拉机时，跟牌方必须同型才能赢。
+        // 跟牌方没对子时可以垫两张散牌跟对子（合法），但散牌永远赢不了对子；
+        // 同理对子赢不了拖拉机，散牌赢不了拖拉机。
+        // 之前只比较 cards[0] 的 value，会导致散牌中较大的牌（如A）
+        // 错误地"赢"了对子。
+        if (leadPattern.type === 'pair' || leadPattern.type === 'tractor') {
+            const followerPattern = getCardPattern(cards, trumpSuit, level, playedCardsHistory);
+            if (followerPattern.type !== leadPattern.type) {
+                continue; // 牌型不一致（散牌/混合垫牌/低一级牌型），不能赢
+            }
+        }
+        
+        const card = cards[0]; // 同型时比较第一张即可
         const cardIsTrump = isTrump(card, trumpSuit, level);
         const cardValue = getCardValue(card, trumpSuit, level);
         
-        // 如果之前不是主牌，现在是主牌，则现在的大
+        // 如果之前不是主牌，现在是主牌，则现在的大（主牌杀副牌，同型前提已保证）
         if (!winnerIsTrump && cardIsTrump) {
             winner = trickCards[i];
             maxValue = cardValue;

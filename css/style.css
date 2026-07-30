@@ -113,6 +113,29 @@ body {
     transform: translateY(-50%);
 }
 
+/* ===== 亮主标记 ===== */
+.trump-badge {
+    display: none;
+    padding: 3px 10px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #ffd700 0%, #ff8c00 100%);
+    color: #1a1a1a;
+    font-size: 13px;
+    font-weight: bold;
+    white-space: nowrap;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+    animation: trumpBadgePulse 2s ease-in-out infinite;
+}
+
+.trump-badge.show {
+    display: inline-block;
+}
+
+@keyframes trumpBadgePulse {
+    0%, 100% { box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4); }
+    50% { box-shadow: 0 2px 12px rgba(255, 215, 0, 0.6); }
+}
+
 .player-info {
     display: flex;
     flex-direction: column;
@@ -202,8 +225,37 @@ body {
 }
 
 /* ===== 牌堆 ===== */
+/* 默认位置（无庄家或庄家在右方时）：右侧 */
 .deck-area {
     position: absolute;
+    right: 80px;
+    top: 50%;
+    transform: translateY(-50%);
+    transition: all 0.5s ease;
+}
+
+/* 底牌跟随庄家位置 */
+.deck-area.deck-near-bottom {
+    right: 250px;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.deck-area.deck-near-left {
+    left: 100px;
+    right: auto;
+    top: 50%;
+    transform: translateY(-50%);
+}
+
+.deck-area.deck-near-top {
+    left: 50%;
+    right: auto;
+    top: 80px;
+    transform: translateX(-50%);
+}
+
+.deck-area.deck-near-right {
     right: 80px;
     top: 50%;
     transform: translateY(-50%);
@@ -276,6 +328,21 @@ body {
 .card.disabled:hover {
     transform: none;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+/* 必出牌高亮（跟对/拖拉机时） */
+.card.mandatory {
+    box-shadow: 0 0 0 3px #00e5ff, 0 2px 6px rgba(0, 0, 0, 0.3);
+    animation: mandatoryPulse 1.5s ease-in-out infinite;
+}
+
+.card.mandatory:hover {
+    box-shadow: 0 0 0 3px #00e5ff, 0 8px 16px rgba(0, 0, 0, 0.4);
+}
+
+@keyframes mandatoryPulse {
+    0%, 100% { box-shadow: 0 0 0 3px #00e5ff, 0 2px 6px rgba(0, 0, 0, 0.3); }
+    50% { box-shadow: 0 0 0 4px #00e5ff, 0 4px 12px rgba(0, 229, 255, 0.4); }
 }
 
 .card-back {
@@ -383,8 +450,15 @@ body {
 }
 
 .hand-area .card {
-    margin-right: -45px;
+    margin-right: -32px;
     flex-shrink: 0;
+    transition: margin-right 0.15s ease;
+}
+
+/* 选中/悬停时展开，减少互相遮挡 */
+.hand-area .card:hover,
+.hand-area .card.selected {
+    margin-right: -10px;
 }
 
 .hand-area .card:last-child {
@@ -866,7 +940,12 @@ body {
     }
     
     .hand-area .card {
-        margin-right: -30px;
+        margin-right: -22px;
+    }
+    
+    .hand-area .card:hover,
+    .hand-area .card.selected {
+        margin-right: -8px;
     }
     
     .game-log {
@@ -898,7 +977,12 @@ body {
     }
     
     .hand-area .card {
-        margin-right: -25px;
+        margin-right: -18px;
+    }
+    
+    .hand-area .card:hover,
+    .hand-area .card.selected {
+        margin-right: -6px;
     }
     
     .deck-area {

@@ -9,6 +9,11 @@ let isHumanTurn = false;
 let currentBid = null;
 let bidPlayer = null;
 
+// 叫主暂停控制：同花色级牌只给一次叫主机会
+let skippedSingleBidSuits = new Set(); // 玩家已放弃的单张叫主花色
+let hasSkippedCounterBid = false;      // 玩家是否已放弃过反主
+let currentBidOptions = null;          // 当前弹窗的叫主选项
+
 // DOM元素引用
 const elements = {};
 
@@ -94,15 +99,67 @@ function updateInfo() {
     for (const pos of ['left', 'top', 'right']) {
         elements.cardCounts[pos].textContent = `${game.players[pos].length}张`;
     }
+
+    // === 底牌跟随庄家位置 ===
+    updateDeckPosition();
+
+    // === 亮主标记 ===
+    updateTrumpBadges();
+}
+
+/**
+ * 底牌跟随庄家位置移动
+ */
+function updateDeckPosition() {
+    const deckArea = document.getElementById('deck-area');
+    if (!deckArea) return;
+
+    // 清除所有位置类
+    deckArea.classList.remove('deck-near-bottom', 'deck-near-left', 'deck-near-top', 'deck-near-right');
+
+    // 根据庄家位置设置底牌位置
+    if (game.dealer) {
+        deckArea.classList.add(`deck-near-${game.dealer}`);
+    } else {
+        // 首轮抢庄前，默认右侧
+        deckArea.classList.add('deck-near-right');
+    }
+}
+
+/**
+ * 亮主标记：在亮主方边上显示主花色
+ */
+function updateTrumpBadges() {
+    // 先清除所有标记
+    for (const pos of ['bottom', 'left', 'top', 'right']) {
+        const badge = document.getElementById(`trump-badge-${pos}`);
+        if (badge) {
+            badge.classList.remove('show');
+            badge.textContent = '';
+        }
+    }
+
+    // 如果已确定主花色且知道是谁亮的，显示标记
+    if (game.trumpSuit !== null && bidPlayer) {
+        const badge = document.getElementById(`trump-badge-${bidPlayer}`);
+        if (badge) {
+            const trumpDisplay = game.trumpSuit ? SUIT_SYMBOLS[game.trumpSuit] : '无主';
+            const isRed = game.trumpSuit === SUITS.HEARTS || game.trumpSuit === SUITS.DIAMONDS;
+            const colorStyle = game.trumpSuit === null ? '' :
+                (isRed ? 'color: #d32f2f;' : 'color: #1a1a1a;');
+            badge.innerHTML = `亮主 <span style="${colorStyle}">${trumpDisplay}</span>`;
+            badge.classList.add('show');
+        }
+    }
 }
 
 // 创建牌的DOM元素
-function createCardElement(card, selectable = false, onClick = null) {
+function createCardElement(card, selectable = false, onClick = null, isMandatory = false) {
     const display = getCardDisplay(card);
     const isTrump = game.trumpSuit && isTrumpCard(card, game.trumpSuit, game.level);
-    
+
     const cardEl = document.createElement('div');
-    cardEl.className = `card ${display.color} ${isTrump ? 'trump' : ''} ${selectable ? '' : 'disabled'}`;
+    cardEl.className = `card ${display.color} ${isTrump ? 'trump' : ''} ${selectable ? '' : 'disabled'} ${isMandatory ? 'mandatory' : ''}`;
     cardEl.dataset.cardId = card.id;
     
     if (card.isJoker) {
@@ -140,16 +197,23 @@ function createCardElement(card, selectable = false, onClick = null) {
 function renderHand() {
     elements.handArea.innerHTML = '';
     const hand = game.players.bottom;
-    
+
+    // 计算必出牌（跟牌时）
+    let mandatoryIds = [];
+    if (isHumanTurn && game.currentTrick && game.currentTrick.length > 0) {
+        mandatoryIds = getMandatoryCardIds(hand, game.currentTrick, game.trumpSuit, game.level);
+    }
+
     for (let i = 0; i < hand.length; i++) {
         const card = hand[i];
-        const cardEl = createCardElement(card, isHumanTurn, onCardClick);
-        
+        const isMandatory = mandatoryIds.includes(card.id);
+        const cardEl = createCardElement(card, isHumanTurn, onCardClick, isMandatory);
+
         // 检查是否已选中
         if (selectedCards.some(c => c.id === card.id)) {
             cardEl.classList.add('selected');
         }
-        
+
         elements.handArea.appendChild(cardEl);
     }
 }
@@ -157,16 +221,41 @@ function renderHand() {
 // 牌点击事件
 function onCardClick(card, cardEl) {
     if (!isHumanTurn) return;
-    
+
     const idx = selectedCards.findIndex(c => c.id === card.id);
     if (idx !== -1) {
+        // 取消选择：总是允许
         selectedCards.splice(idx, 1);
         cardEl.classList.remove('selected');
-    } else {
-        selectedCards.push(card);
-        cardEl.classList.add('selected');
+        updateActionButtons();
+        return;
     }
-    
+
+    // === 必出牌限制检查 ===
+    if (game.currentTrick && game.currentTrick.length > 0) {
+        const hand = game.players.bottom;
+        const mandatoryIds = getMandatoryCardIds(hand, game.currentTrick, game.trumpSuit, game.level);
+
+        if (mandatoryIds.length > 0) {
+            const isMandatory = mandatoryIds.includes(card.id);
+            const leadCards = game.currentTrick[0].cards;
+            const leadPattern = getCardPattern(leadCards, game.trumpSuit, game.level, game.playedCardsHistory || []);
+
+            if (!isMandatory) {
+                // 选的不是必出牌，检查必出要求是否已满足
+                const satisfied = hasSatisfiedMandatory(
+                    selectedCards, mandatoryIds, leadPattern.type, game.trumpSuit, game.level
+                );
+                if (!satisfied) {
+                    log('请先出完必选的牌（对子/拖拉机）');
+                    return;
+                }
+            }
+        }
+    }
+
+    selectedCards.push(card);
+    cardEl.classList.add('selected');
     updateActionButtons();
 }
 
@@ -278,6 +367,10 @@ function startRound() {
     selectedCards = [];
     currentBid = null;
     bidPlayer = null;
+    skippedSingleBidSuits.clear();
+    hasSkippedCounterBid = false;
+    currentBidOptions = null;
+    game.trumpSuit = null;
     
     log(`开始发牌，当前打 ${game.level}${isFirstRound ? '（首轮抢庄）' : `，庄家: ${game.dealer === 'bottom' ? '你' : game.dealer === 'left' ? 'AI-左' : game.dealer === 'top' ? 'AI-上' : 'AI-右'}`}`);
     updateInfo();
@@ -338,11 +431,14 @@ function dealNextCardAnimated() {
         
         if (availableBids.length > 0) {
             if (result.player === 'bottom') {
-                // 玩家：暂停5秒，显示叫主/反主弹窗
-                // 先清除可能存在的发牌计时器，确保弹窗期间不再发牌
-                if (dealTimer) { clearTimeout(dealTimer); dealTimer = null; }
-                showBidPauseNotice(availableBids);
-                return;
+                // 玩家：检查是否应该暂停发牌给叫主机会
+                const shouldPause = checkShouldPauseForBid(availableBids);
+                if (shouldPause) {
+                    if (dealTimer) { clearTimeout(dealTimer); dealTimer = null; }
+                    showBidPauseNotice(availableBids);
+                    return;
+                }
+                // 不暂停，继续发牌（AI仍可能叫主）
             } else {
                 // AI：自动决定是否叫主/反主（不暂停动画）
                 const ai = aiPlayers[result.player];
@@ -367,7 +463,32 @@ function dealNextCardAnimated() {
     }
     
     // 0.3秒后发下一张
-    dealTimer = setTimeout(() => dealNextCardAnimated(), 300);
+    dealTimer = setTimeout(() => dealNextCardAnimated(), 100);
+}
+
+/**
+ * 检查是否应该为玩家暂停发牌，给出叫主/反主机会
+ *
+ * 规则：
+ *   - 主动叫主：每种花色的单张级牌只给一次5秒机会
+ *   - 反主：只给一次反主机会（无论花色）
+ */
+function checkShouldPauseForBid(availableBids) {
+    const cb = game.bidState.currentBid;
+
+    if (!cb) {
+        // 主动叫主：检查是否有新花色的单张级牌
+        const singleBids = availableBids.filter(b => b.type === BID_TYPES.SINGLE);
+        for (const bid of singleBids) {
+            if (bid.suit && !skippedSingleBidSuits.has(bid.suit)) {
+                return true;
+            }
+        }
+        return false;
+    } else {
+        // 反主：只给一次反主机会
+        return !hasSkippedCounterBid;
+    }
 }
 
 /**
@@ -413,6 +534,7 @@ function handleAiBid(player, bidDecision) {
 
 // 叫主暂停提示（5秒倒计时）—— 适配新叫主系统
 function showBidPauseNotice(availableBids) {
+    currentBidOptions = availableBids;
     const names = { left: 'AI-左', top: 'AI-上', right: 'AI-右' };
     
     const notice = document.createElement('div');
@@ -536,13 +658,30 @@ function showBidPauseNotice(availableBids) {
 function closeBidPauseNotice(bidCalled) {
     const notice = document.getElementById('bid-pause-notice');
     if (notice) notice.remove();
-    
-    if (!bidCalled) {
-        log('未叫主，继续发牌');
+
+    if (!bidCalled && currentBidOptions) {
+        const cb = game.bidState.currentBid;
+        if (!cb) {
+            // 主动叫主：记录放弃的花色
+            for (const bid of currentBidOptions) {
+                if (bid.type === BID_TYPES.SINGLE && bid.suit) {
+                    skippedSingleBidSuits.add(bid.suit);
+                }
+            }
+            log('未叫主，继续发牌');
+        } else {
+            // 反主：记录已放弃反主
+            hasSkippedCounterBid = true;
+            log('未反主，继续发牌');
+        }
+    } else if (bidCalled) {
+        // 叫主成功，清除主动叫主的跳过记录（进入新的叫主阶段）
+        skippedSingleBidSuits.clear();
     }
-    
+    currentBidOptions = null;
+
     // 继续发牌
-    dealTimer = setTimeout(() => dealNextCardAnimated(), 300);
+    dealTimer = setTimeout(() => dealNextCardAnimated(), 100);
 }
 
 // 发牌完成后
@@ -584,6 +723,8 @@ function finalCounterBidPhase() {
             if (success) {
                 const trumpDisplay = bidDecision.suit ? SUIT_SYMBOLS[bidDecision.suit] : '无主';
                 log(`✅ ${names[player]} 反主 ${bidDecision.display} → 主: ${trumpDisplay}`);
+                currentBid = game.bidState.currentBid;
+                bidPlayer = player;
                 updateInfo();
                 for (const pos of PLAYERS) {
                     game.sortHand(pos);
@@ -592,7 +733,7 @@ function finalCounterBidPhase() {
             }
         }
     }
-    
+
     // 检查玩家是否能反主
     const playerHand = game.players.bottom;
     const availableBids = getAvailableBids(playerHand, game.level, game.bidState.currentBid);
@@ -682,10 +823,12 @@ function showFinalCounterNotice(availableBids) {
                 console.warn('[最终反主] makeBid失败，当前currentBid=', game.bidState.currentBid);
                 return;
             }
-            
+
             const trumpDisplay = bid.suit ? SUIT_SYMBOLS[bid.suit] : '无主';
             log(`✅ 你 反主 ${bid.display} → 主: ${trumpDisplay}`);
-            
+            currentBid = game.bidState.currentBid;
+            bidPlayer = 'bottom';
+
             updateInfo();
             for (const pos of PLAYERS) {
                 game.sortHand(pos);
@@ -742,6 +885,8 @@ function finalAiBidPhase() {
             if (success) {
                 const trumpDisplay = bidDecision.suit ? SUIT_SYMBOLS[bidDecision.suit] : '无主';
                 log(`✅ ${names[player]} 叫主 ${bidDecision.display} → 主: ${trumpDisplay}`);
+                currentBid = game.bidState.currentBid;
+                bidPlayer = player;
                 updateInfo();
                 for (const pos of PLAYERS) {
                     game.sortHand(pos);
@@ -752,7 +897,7 @@ function finalAiBidPhase() {
             }
         }
     }
-    
+
     // 检查玩家是否能叫主
     const playerHand = game.players.bottom;
     const availableBids = getAvailableBids(playerHand, game.level, null);
@@ -1272,6 +1417,124 @@ function forceValidPlay(hand, trickCards, trumpSuit, level) {
         result.push(trumps.shift());
     }
     return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  必出牌高亮（防作弊）—— 跟对/拖拉机时必须出同型牌
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 获取玩家必须出的牌的ID集合（用于UI高亮）
+ *
+ * 规则：
+ *   - 首家出对子，玩家有对子 → 高亮所有对子牌
+ *   - 首家出拖拉机，玩家有拖拉机 → 高亮拖拉机牌
+ *     无拖拉机但有2+对子 → 高亮所有对子牌
+ *     只有1对子 → 高亮该对子牌
+ *   - 首家出单张/甩牌，或玩家断门 → 无必出限制
+ *
+ * @param {Array} hand - 玩家手牌
+ * @param {Array} trickCards - 当前轮已出的牌
+ * @param {string|null} trumpSuit - 主花色
+ * @param {string} level - 当前级别
+ * @returns {Array} 必出牌的ID数组
+ */
+function getMandatoryCardIds(hand, trickCards, trumpSuit, level) {
+    if (!trickCards || trickCards.length === 0) return [];
+
+    const playedCardsHistory = game.playedCardsHistory || [];
+    const leadCards = trickCards[0].cards;
+    const leadPattern = getCardPattern(leadCards, trumpSuit, level, playedCardsHistory);
+    const leadSuit = getLeadSuit(leadCards, trumpSuit, level);
+    const needLen = leadPattern.length;
+
+    // 首家出主牌
+    if (leadSuit === null) {
+        const trumps = hand.filter(c => isTrump(c, trumpSuit, level));
+        if (trumps.length >= needLen) {
+            if (leadPattern.type === 'pair') {
+                const pairs = findPairsInCards(trumps, trumpSuit, level);
+                if (pairs.length > 0) {
+                    return pairs.flat().map(c => c.id);
+                }
+            }
+            if (leadPattern.type === 'tractor') {
+                const tractors = findTractorsInCards(trumps, trumpSuit, level);
+                if (tractors.length > 0) {
+                    return tractors[0].map(c => c.id);
+                }
+                const pairs = findPairsInCards(trumps, trumpSuit, level);
+                if (pairs.length >= 2) {
+                    return pairs.slice(0, 2).flat().map(c => c.id);
+                }
+                if (pairs.length === 1) {
+                    return pairs[0].map(c => c.id);
+                }
+            }
+        }
+        return [];
+    }
+
+    // 首家出副牌
+    const leadSuitCards = hand.filter(c =>
+        !c.isJoker && c.suit === leadSuit && !isTrump(c, trumpSuit, level)
+    );
+    if (leadSuitCards.length === 0) return []; // 断门，无限制
+
+    if (leadSuitCards.length >= needLen) {
+        if (leadPattern.type === 'pair') {
+            const pairs = findPairsInCards(leadSuitCards, trumpSuit, level);
+            if (pairs.length > 0) {
+                return pairs.flat().map(c => c.id);
+            }
+        }
+        if (leadPattern.type === 'tractor') {
+            const tractors = findTractorsInCards(leadSuitCards, trumpSuit, level);
+            if (tractors.length > 0) {
+                return tractors[0].map(c => c.id);
+            }
+            const pairs = findPairsInCards(leadSuitCards, trumpSuit, level);
+            if (pairs.length >= 2) {
+                return pairs.slice(0, 2).flat().map(c => c.id);
+            }
+            if (pairs.length === 1) {
+                return pairs[0].map(c => c.id);
+            }
+        }
+    }
+    return [];
+}
+
+/**
+ * 检查已选牌是否已满足必出要求
+ *
+ * @param {Array} selected - 已选牌
+ * @param {Array} mandatoryIds - 必出牌ID
+ * @param {string} leadPatternType - 首家牌型
+ * @param {string|null} trumpSuit - 主花色
+ * @param {string} level - 当前级别
+ * @returns {boolean}
+ */
+function hasSatisfiedMandatory(selected, mandatoryIds, leadPatternType, trumpSuit, level) {
+    if (mandatoryIds.length === 0) return true;
+
+    const selectedMandatory = selected.filter(sc => mandatoryIds.includes(sc.id));
+
+    if (leadPatternType === 'pair') {
+        // 已选牌中是否有对子
+        const pairs = findPairsInCards(selectedMandatory, trumpSuit, level);
+        return pairs.length > 0;
+    }
+
+    if (leadPatternType === 'tractor') {
+        // 已选牌中是否有拖拉机或2+对子
+        const tractors = findTractorsInCards(selectedMandatory, trumpSuit, level);
+        if (tractors.length > 0) return true;
+        const pairs = findPairsInCards(selectedMandatory, trumpSuit, level);
+        return pairs.length >= 2;
+    }
+
+    return true;
 }
 
 // 初始化

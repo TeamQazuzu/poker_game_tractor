@@ -23,7 +23,8 @@ class TractorAI {
                 top: new Set(),
                 right: new Set(),
                 bottom: new Set()
-            }
+            },
+            trickCount: 0        // 轮次计数（用于判断开局阶段）
         };
     }
 
@@ -150,6 +151,178 @@ class TractorAI {
      */
     _isEndGame(hand) {
         return hand.length <= 6;
+    }
+
+    /**
+     * 判断是否处于开局阶段
+     * hand.length >= 18：开局前2-3轮，出牌权争夺至关重要
+     */
+    _isEarlyGame(hand) {
+        return hand.length >= 18;
+    }
+
+    /**
+     * 判断是否处于中盘阶段
+     * hand.length 在7~17之间：中盘，出牌权开始不那么重要，拦截更重要
+     */
+    _isMidGame(hand) {
+        return hand.length > 6 && hand.length < 18;
+    }
+
+    /**
+     * 判断是否应该进行拦截
+     *
+     * 拦截场景：到了中盘，庄家走小牌单张，下家小跟，无分。
+     * 此时队友AI要用一张中级牌保证最后一家不轻松跑分。
+     *
+     * 条件：
+     *   1. 中盘阶段（手牌7~17张）
+     *   2. 桌上无分（trickScore === 0）
+     *   3. 非最后一家（后面还有玩家可能跑分）
+     *   4. 队友出的是小牌（不是A/K等大牌）
+     *
+     * @returns {boolean}
+     */
+    _shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, leadSuit) {
+        // 中盘才拦截
+        if (!this._isMidGame(hand)) return false;
+        // 有分不拦截（有分时该贴分贴分，该杀杀）
+        if (trickScore > 0) return false;
+        // 非最后一家才需要拦截（最后一家时队友已赢，贴分即可）
+        if (trickCards.length >= 3) return false;
+
+        return true;
+    }
+
+    /**
+     * 找到用于拦截的副牌
+     *
+     * 拦截策略：用J/Q等中级牌拦截，防止最后一家出10得分的可能性。
+     * - 不用A（中盘AK大概率走完了，留着也是浪费）
+     * - 不用K（如果有K是最后一家的那是他的分，拦不住）
+     * - 优先用J/Q，其次用其他中级牌（7~9如果比当前赢家大）
+     * - 不用分牌（5/10/K）
+     * - 不拆对子
+     *
+     * @param {Array} leadSuitCards - 该花色的手牌（已排序，小→大）
+     * @returns {Object|null} 拦截牌，或null
+     */
+    _findInterceptCard(leadSuitCards, trumpSuit, level) {
+        if (!leadSuitCards || leadSuitCards.length === 0) return null;
+
+        // 找出当前赢家的牌值
+        // leadSuitCards已排序小→大，我们需要出一张比当前赢家大的中级牌
+
+        // 优先用J或Q拦截（最理想的拦截牌）
+        const jqCards = leadSuitCards.filter(c => {
+            if (this._isPointCard(c)) return false; // 不用分牌
+            const val = getCardValue(c, trumpSuit, level);
+            // J=9, Q=10 在RANKS中的index，副牌value就是index
+            return c.rank === 'J' || c.rank === 'Q';
+        });
+        if (jqCards.length > 0) {
+            return jqCards[0]; // 最小的J或Q
+        }
+
+        // 没有J/Q，看有没有其他中级非分牌（7/8/9）比当前桌面最大牌大
+        // 找出非分牌中最大的
+        const midCards = leadSuitCards.filter(c => {
+            if (this._isPointCard(c)) return false;
+            // 排除A（太大，留着）和K（是分牌已被排除）
+            if (c.rank === 'A') return false;
+            return ['7', '8', '9'].includes(c.rank);
+        });
+        if (midCards.length > 0) {
+            return midCards[midCards.length - 1]; // 最大的中级牌
+        }
+
+        // 实在没有合适的拦截牌，返回null（走默认逻辑）
+        return null;
+    }
+
+    /**
+     * 找到用于拦截的主牌
+     *
+     * 主牌拦截策略：用A/级牌拦截，防止最后一家轻松跑分。
+     * - 优先用单张主牌A（最有价值的拦截牌）
+     * - 其次用主级牌（级牌也是强主牌）
+     * - 不轻易拆A对或级牌对（保留用于抠底/毙杀）
+     * - 必要时可用王（但中盘不太建议，除非无其他选择）
+     *
+     * @param {Array} trumps - 主牌（已排序，小→大）
+     * @param {Array} trickCards - 当前桌面牌
+     * @returns {Object|null} 拦截牌，或null
+     */
+    _findInterceptTrump(trumps, trickCards, trumpSuit, level) {
+        if (!trumps || trumps.length === 0) return null;
+
+        const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+        const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+
+        // 找出所有比当前赢家大的主牌
+        const biggerTrumps = trumps.filter(c =>
+            getCardValue(c, trumpSuit, level) > winnerValue
+        );
+        if (biggerTrumps.length === 0) return null;
+
+        // 1. 优先用单张主牌A（主花色的A）
+        //    主花色A的value在200~211范围内（取决于是否是级牌）
+        const trumpAce = biggerTrumps.find(c => {
+            if (c.isJoker) return false;
+            if (c.rank !== 'A') return false;
+            // 检查是否是单张（不在对子中）
+            const pairs = this._findPairs(trumps, trumpSuit, level);
+            const inPair = pairs.some(p => p.some(pc => pc.id === c.id));
+            return !inPair; // 只用单张A，不拆对
+        });
+        if (trumpAce) return trumpAce;
+
+        // 2. 用主级牌（级牌单张）
+        //    主级牌value=213，副级牌value=212
+        const levelCard = biggerTrumps.find(c => {
+            if (c.isJoker) return false;
+            if (c.rank !== level) return false; // 级牌
+            const val = getCardValue(c, trumpSuit, level);
+            if (val < 212) return false; // 确认是级牌
+            // 检查是否是单张
+            const pairs = this._findPairs(trumps, trumpSuit, level);
+            const inPair = pairs.some(p => p.some(pc => pc.id === c.id));
+            return !inPair; // 只用单张级牌，不拆对
+        });
+        if (levelCard) return levelCard;
+
+        // 3. 用其他较大的非王主牌（主花色K/Q/J等）
+        const otherBigTrump = biggerTrumps.find(c => {
+            if (c.isJoker) return false;
+            const val = getCardValue(c, trumpSuit, level);
+            if (val >= 212) return false; // 跳过级牌（上面已处理）
+            // 检查是否是单张
+            const pairs = this._findPairs(trumps, trumpSuit, level);
+            const inPair = pairs.some(p => p.some(pc => pc.id === c.id));
+            return !inPair;
+        });
+        if (otherBigTrump) return otherBigTrump;
+
+        // 4. 最后考虑用王（小王优先，大王太珍贵）
+        //    只有在中盘且无其他选择时才用
+        const smallJoker = biggerTrumps.find(c => c.isJoker && c.rank === 'small');
+        if (smallJoker) return smallJoker;
+
+        // 不用大王拦截（太珍贵，留给尾盘保底/抠底）
+        return null;
+    }
+
+    /**
+     * 判断出牌模式中的主牌是否是小主牌
+     * 小主牌定义：主花色普通小牌（value 200~208），不是级牌，不是王
+     */
+    _isSmallTrumpCard(leadPattern, trumpSuit, level) {
+        if (!leadPattern || !leadPattern.cards || leadPattern.cards.length === 0) return false;
+        const card = leadPattern.cards[0];
+        if (!isTrump(card, trumpSuit, level)) return false;
+        const val = getCardValue(card, trumpSuit, level);
+        // 主花色普通小牌：200~208，不含级牌(212/213)和王(220+)
+        return val >= 200 && val <= 208;
     }
 
     /**
@@ -301,16 +474,124 @@ class TractorAI {
         const counterBids = availableBids.filter(b => canCounterBid(currentBid, b.type));
         if (counterBids.length === 0) return null;
 
+        // 统计各花色长度（级牌除外，级牌无论是否主都是主牌）
+        const suitLen = {};
+        for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
+            suitLen[suit] = hand.filter(c => !c.isJoker && c.suit === suit && c.rank !== level).length;
+        }
+
         const handSize = hand.length;
         const trumpRelatedCount = hand.filter(c =>
             c.isJoker || c.rank === level
         ).length;
 
-        const shouldCounter = trumpRelatedCount >= 4 || handSize >= 20;
+        // 反主决策：
+        //   1. 长套花色的级牌对子反主 → 把长套变成主牌，获得主牌数量优势
+        //      （如3张黑桃8张红桃+红桃级牌对，反主让红桃成主牌）
+        //   2. 常主多（王+级牌≥4）或抓牌接近结束（handSize>=20）→ 反主
+        const pairLevelBids = counterBids.filter(b => b.type === BID_TYPES.PAIR_LEVEL);
+
+        // 优先：长套花色（≥7张）的级牌对子反主，夺取主牌数量优势
+        for (const bid of pairLevelBids) {
+            if (suitLen[bid.suit] >= 7) return bid;
+        }
+
+        // 有级牌对子或王对时，门槛降低（有强牌在手，中后期即可反主）
+        const noTrumpBids = counterBids.filter(b =>
+            b.type === BID_TYPES.PAIR_SMALL_JOKER || b.type === BID_TYPES.PAIR_BIG_JOKER
+        );
+        const hasStrongCounter = pairLevelBids.length > 0 || noTrumpBids.length > 0;
+        const shouldCounter = trumpRelatedCount >= 4 || handSize >= 15 || hasStrongCounter;
         if (!shouldCounter) return null;
 
-        counterBids.sort((a, b) => b.power - a.power);
-        return counterBids[0];
+        // 有级牌对子时，优先用最长套的级牌对反主（而非反无主），
+        // 以获得主牌数量优势；只有王对才反无主
+        if (pairLevelBids.length > 0) {
+            pairLevelBids.sort((a, b) => suitLen[b.suit] - suitLen[a.suit]);
+            return pairLevelBids[0];
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  无主反主决策（王对反主）—— 不要盲目反无主
+        // ═══════════════════════════════════════════════════════════════
+        // 无主通常不是好局面：
+        //   - 主牌只有12张常主，每人平均3张，断门也难毙杀
+        //   - 只有两种情况下适合叫无主：
+        //     1. 庄家式：副牌强势 + 主牌不理想 → 规避主牌弱势，发挥副牌优势
+        //     2. 捣乱式：别人已叫主 + 自己主牌不理想 → 抹掉庄家主牌优势
+        //   - 主牌强势时绝不应叫无主（放弃自己的主牌优势太傻）
+        if (noTrumpBids.length > 0) {
+            // 评估主牌理想程度
+            const bigJokers = hand.filter(c => c.isJoker && c.rank === 'big');
+            const smallJokers = hand.filter(c => c.isJoker && c.rank === 'small');
+            const levelCards = hand.filter(c => c.rank === level);
+
+            // 主牌评分：大王(+4) 小王(+3) 级牌(+2)
+            let trumpScore = bigJokers.length * 4 + smallJokers.length * 3 + levelCards.length * 2;
+
+            // 如果已有叫主花色，该花色非级牌牌张 → 反无主会损失这些主牌
+            // 只给大牌（A/K/Q/J）计较高损失，小牌损失很小
+            if (currentBid && currentBid.suit) {
+                const currentTrumpSuitCards = hand.filter(c =>
+                    c.suit === currentBid.suit && !c.isJoker && c.rank !== level
+                );
+                const highCards = currentTrumpSuitCards.filter(c =>
+                    ['A', 'K', 'Q', 'J'].includes(c.rank)
+                );
+                const lowCards = currentTrumpSuitCards.filter(c =>
+                    !['A', 'K', 'Q', 'J'].includes(c.rank)
+                );
+                trumpScore += highCards.length * 1.0 + lowCards.length * 0.3;
+            }
+
+            // 副牌评分：评估副牌强势程度
+            let sideSuitScore = 0;
+            for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
+                if (currentBid && suit === currentBid.suit) continue;
+                const sCards = hand.filter(c => c.suit === suit && !c.isJoker && c.rank !== level);
+                for (const c of sCards) {
+                    if (c.rank === 'A') sideSuitScore += 3;
+                    else if (c.rank === 'K') sideSuitScore += 2;
+                    else if (c.rank === 'Q') sideSuitScore += 1.5;
+                    else if (c.rank === 'J') sideSuitScore += 1;
+                    else if (c.rank === '10') sideSuitScore += 0.5;
+                }
+                // 对子额外加分
+                const pairs = this._findPairs(sCards, currentBid ? currentBid.suit : null, level);
+                sideSuitScore += pairs.length * 2;
+            }
+
+            let shouldNoTrump = false;
+
+            // 主牌很不理想时，才考虑无主
+            if (trumpScore <= 8) {
+                if (sideSuitScore >= 12) {
+                    // 副牌强势 + 主牌弱 → 庄家式叫无主
+                    // 规避主牌弱势，强行把大家主牌拉到同一水平，发挥副牌优势
+                    shouldNoTrump = true;
+                } else if (currentBid) {
+                    // 别人已叫主，自己主牌不理想 → 捣乱式反无主
+                    // 抹掉庄家主牌优势，把胜率从~10%提升到~40%
+                    shouldNoTrump = true;
+                }
+            } else if (trumpScore <= 10 && sideSuitScore >= 12) {
+                // 主牌一般偏弱但副牌强势 → 也可以叫无主发挥副牌优势
+                shouldNoTrump = true;
+            }
+
+            // 主牌强势时绝不叫无主（放弃自己的主牌优势太傻）
+            if (trumpScore >= 12) {
+                shouldNoTrump = false;
+            }
+
+            if (shouldNoTrump) {
+                noTrumpBids.sort((a, b) => b.power - a.power);
+                return noTrumpBids[0];
+            }
+        }
+
+        // 没有级牌对子，也不适合无主 → 不反主
+        return null;
     }
 
     // ================================================================
@@ -393,8 +674,21 @@ class TractorAI {
 
         // 4a. 尝试断门短套副牌（2-4张的副牌花色）
         //     断门可以减少防守压力，但要权衡分牌风险
+        //
+        //     AQQ技巧：含A（或KK/QQ强对子）的花色不整体埋掉断门——
+        //     留下AQQ先打A（必赢），再打QQ（大概率赢），打光后自然断门，
+        //     既赢墩又不浪费强牌。只有全是小牌的短套才直接埋掉断门。
         const shortSuits = Object.entries(suitAnalysis)
             .filter(([s, info]) => info.count >= 1 && info.count <= 4)
+            .filter(([s, info]) => {
+                // 含A的花色保留（留A打出去再造断门，A必赢一墩）
+                if (info.cards.some(c => c.rank === 'A')) return false;
+                // 含KK/QQ对子的短套也保留（强对子可打出赢墩后断门）
+                const hasStrongPair = info.cards.some(c => c.rank === 'K' || c.rank === 'Q') &&
+                    this._findPairs(info.cards, trumpSuit, level).length > 0;
+                if (hasStrongPair) return false;
+                return true;
+            })
             .sort((a, b) => {
                 // 优先断分牌少的花色（风险低）
                 const aRisk = a[1].pointValue;
@@ -556,17 +850,18 @@ class TractorAI {
         const isDealerTeam = this._isDealerTeam(dealer);
 
         if (trickCards.length === 0) {
-            return this._leadPlay(hand, trumpSuit, level, isDealerTeam);
+            return this._leadPlay(hand, trumpSuit, level, isDealerTeam, dealer);
         }
 
-        return this._followPlay(hand, trickCards, trumpSuit, level, isDealerTeam);
+        return this._followPlay(hand, trickCards, trumpSuit, level, isDealerTeam, dealer);
     }
 
     // ================================================================
     //  首家出牌策略
     // ================================================================
 
-    _leadPlay(hand, trumpSuit, level, isDealerTeam) {
+    _leadPlay(hand, trumpSuit, level, isDealerTeam, dealer) {
+        this.memory.trickCount++; // 新的一轮开始
         const trumps = this._sortByValue(hand.filter(c => isTrump(c, trumpSuit, level)), trumpSuit, level);
         const nonTrumps = this._sortByValue(hand.filter(c => !isTrump(c, trumpSuit, level)), trumpSuit, level);
 
@@ -587,7 +882,7 @@ class TractorAI {
         }
 
         if (isDealerTeam) {
-            return this._leadAsDealer(trumps, suitGroups, trumpSuit, level, hand);
+            return this._leadAsDealer(trumps, suitGroups, trumpSuit, level, hand, dealer);
         } else {
             return this._leadAsAttacker(trumps, suitGroups, trumpSuit, level, hand);
         }
@@ -770,7 +1065,18 @@ class TractorAI {
      * 4. 对手已断门的花色，即使有A也不出（会被主牌杀）
      * 5. 如果没有可以安全出的大牌，出最长套的小牌消耗对手主牌
      */
-    _leadAsDealer(trumps, suitGroups, trumpSuit, level, hand) {
+    _leadAsDealer(trumps, suitGroups, trumpSuit, level, hand, dealer) {
+        // 判断当前AI是庄家还是庄家队友
+        const isDealer = this.position === dealer;
+        const isTeammate = !isDealer;
+
+        // === 队友开局策略：如果庄家已显示断门，优先走庄家断门花色让庄家杀牌 ===
+        // 队友上手后，通过走庄家断门的花色送牌权回来给庄家毙杀
+        if (isTeammate && this._isEarlyGame(hand)) {
+            const voidSuitLead = this._leadDealerVoidSuit(suitGroups, dealer, trumpSuit, level);
+            if (voidSuitLead) return voidSuitLead;
+        }
+
         // 1. 出副牌A单张（短套优先，让队友跑分更容易）
         //    但要排除对手已断门的花色（出A会被杀）
         const aCandidates = [];
@@ -840,6 +1146,19 @@ class TractorAI {
         const pairResult = this._decideLeadPair(suitGroups, trumpSuit, level);
         if (pairResult) return pairResult
 
+        // 4.5 开局阶段，走完必胜牌后走小单主牌让队友上手
+        //     策略：庄家走完A、K等必胜牌后，若没走过大对子测试，走小单主牌比冒险走小对子更安全
+        //     队友上手后可以出强势牌或判断庄家断门，送牌权回来给庄家杀牌
+        //     注意：如果已经走过大对子测试（对手没跟对子），小对子也是安全的，无需走小主牌
+        if (this._isEarlyGame(hand) && trumps.length > 0) {
+            if (!this._hasTestedBigPairInAnySuit(trumpSuit, level)) {
+                // 没走过大对子测试，不知道该花色是否有对手对子
+                // 优先走小单主牌，让队友上手 → 队友出强势牌 → 庄家跑分
+                const smallTrump = this._findBestSmallTrump(trumps, trumpSuit, level);
+                if (smallTrump) return [smallTrump];
+            }
+        }
+
         // 5. 出副牌拖拉机（连对）——大牌控制
         for (const suit of Object.keys(suitGroups)) {
             const tractor = this._findBestTractor(suitGroups[suit], trumpSuit, level);
@@ -854,6 +1173,15 @@ class TractorAI {
         //     小主牌出手有约60%概率赢（对手可能断主或不愿浪费大主牌跟一张小主牌）
         const smallTrumpLead = this._decideSmallTrumpLead(trumps, trumpSuit, level);
         if (smallTrumpLead) return smallTrumpLead;
+
+        // 5.8 主牌强势时，主动出主牌消耗对手，建立控场优势
+        //     主牌对子/拖拉机+数量多 → 上手打出强势主牌让对手主牌断门
+        if (this._hasStrongTrumpToLead(trumps, hand, trumpSuit, level)) {
+            const trumpTractors = this._findTractors(trumps, trumpSuit, level);
+            if (trumpTractors.length > 0) return trumpTractors[0];
+            const trumpPairs = this._findPairs(trumps, trumpSuit, level);
+            if (trumpPairs.length > 0) return trumpPairs[trumpPairs.length - 1];
+        }
 
         // 6. 如果副牌都是小牌，出最长套的小牌（消耗对手主牌）
         let longestSuit = null;
@@ -880,6 +1208,42 @@ class TractorAI {
             if (suitGroups[suit].length > 0) return [suitGroups[suit][0]];
         }
         return [hand[0]];
+    }
+
+    /**
+     * 队友开局策略：如果庄家已显示某花色断门，走该花色单张让庄家杀牌
+     *
+     * 场景：队友上手后，通过记忆判断庄家断了哪门花色，
+     * 然后走该花色单张让庄家用主牌毙杀，把出牌权送还给庄家。
+     * 这样控场就能轻轻松松过渡到中盘。
+     *
+     * @returns {Array|null} 要出的牌，或null
+     */
+    _leadDealerVoidSuit(suitGroups, dealer, trumpSuit, level) {
+        // 检查庄家断门的花色
+        const voidSuits = [];
+        for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
+            if (this._isPlayerVoid(dealer, suit) && suitGroups[suit] && suitGroups[suit].length > 0) {
+                // 庄家断了该花色，且队友手上有该花色牌
+                voidSuits.push(suit);
+            }
+        }
+
+        if (voidSuits.length === 0) return null;
+
+        // 优先走短套（队友手上该花色牌越少，说明越危险，尽快走掉）
+        voidSuits.sort((a, b) => suitGroups[a].length - suitGroups[b].length);
+
+        const targetSuit = voidSuits[0];
+        const cards = suitGroups[targetSuit];
+
+        // 走单张（给庄家杀牌，保留对子等其他形式）
+        // 优先走最小的非分牌（不要让庄家杀牌时把分牌也杀走）
+        const nonPointCards = cards.filter(c => !this._isPointCard(c));
+        if (nonPointCards.length > 0) return [nonPointCards[0]];
+
+        // 全是分牌，走最小的
+        return [cards[0]];
     }
 
     /**
@@ -1028,8 +1392,13 @@ class TractorAI {
             if (item.oppVoid) continue; // 对手都断了，不出
 
             if (item.rank === 'A') {
-                // A对永远可以出
-                return item.pair;
+                // A对：拆单张利于队友跑分，出对子逼对手对子
+                // 两种策略各50%概率，增加AI不可预测性
+                if (Math.random() < 0.5) {
+                    return item.pair; // 出对子，逼对手对子
+                } else {
+                    return [item.pair[0]]; // 拆单张，利于队友跑10跑5
+                }
             }
             if (item.rank === 'K') {
                 // K对：出过1张A就出
@@ -1104,6 +1473,20 @@ class TractorAI {
                 c.suit === suit && c.rank === rank && !isTrump(c, trumpSuit, level)
             );
             if (played.length >= 2) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 判断是否在任意花色中出过大对子测试
+     * 用于开局策略：如果庄家没走过大对子，不知道外面是否有对子，
+     * 走小单主牌比冒险走小对子更安全
+     */
+    _hasTestedBigPairInAnySuit(trumpSuit, level) {
+        for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
+            if (this._hasTestedBigPairInSuit(suit, trumpSuit, level)) {
                 return true;
             }
         }
@@ -1212,14 +1595,41 @@ class TractorAI {
         return null;
     }
 
+    /**
+     * 找到最小的合适主牌用于"让队友上手"策略
+     * 与 _decideSmallTrumpLead 不同，这个方法总是返回结果（非概率性）
+     * 用于庄家开局策略：走完必胜牌后，走小单主牌让队友上手
+     */
+    _findBestSmallTrump(trumps, trumpSuit, level) {
+        if (!trumps || trumps.length === 0) return null;
+
+        // 优先找主花色普通小牌（value 200~208）
+        const smallTrumps = trumps.filter(c => {
+            const val = getCardValue(c, trumpSuit, level);
+            return val >= 200 && val <= 208;
+        });
+        if (smallTrumps.length > 0) return smallTrumps[0];
+
+        // 没有主花色小牌，看有没有其他较小主牌（不含级牌和王）
+        const otherSmallTrumps = trumps.filter(c => {
+            const val = getCardValue(c, trumpSuit, level);
+            return val < 212;
+        });
+        if (otherSmallTrumps.length > 0) return otherSmallTrumps[0];
+
+        // 实在没有小主牌，出最小的主牌
+        return trumps[0];
+    }
+
     // ================================================================
     //  跟牌策略
     // ================================================================
 
-    _followPlay(hand, trickCards, trumpSuit, level, isDealerTeam) {
+    _followPlay(hand, trickCards, trumpSuit, level, isDealerTeam, dealer) {
         const leadCards = trickCards[0].cards;
         const leadPattern = getCardPattern(leadCards, trumpSuit, level, this.memory.playedCards);
         const leadSuit = getLeadSuit(leadCards, trumpSuit, level);
+        const leadPlayer = trickCards[0].player;
 
         // 判断当前谁在赢
         const currentWinner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
@@ -1244,7 +1654,7 @@ class TractorAI {
 
         // === 首家出的是主牌 ===
         if (leadSuit === null) {
-            return this._followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer);
+            return this._followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadPlayer, dealer);
         }
 
         // === 首家出的是副牌花色 ===
@@ -1266,7 +1676,7 @@ class TractorAI {
     /**
      * 跟主牌
      */
-    _followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer) {
+    _followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadPlayer, dealer) {
         const needLen = leadPattern.length;
 
         // 主牌不够，尽量出主牌，不够的用副牌补足
@@ -1295,19 +1705,72 @@ class TractorAI {
         }
 
         if (leadPattern.type === 'single') {
-            // 队友赢 → 不抢出牌权，出最小主牌
-            // 倒数第二轮绝不出大王抢牌权：留大王给最后一轮主动出（"先出的大王大"）
-            //   队友赢本轮 → 最后一轮队友主动出牌 → 若队友有大王则确保赢
-            //   若提前出大王 → 最后一轮就失去威力
+            // === 开局策略：庄家走小单主牌让队友上手 ===
+            // 庄家开局走小单主牌的意图是让队友上手，队友应主动抢出牌权
+            // 对手则应阻止庄家队友上手
+            const dealerLeadingSmallTrump = this._isEarlyGame(hand) &&
+                leadPlayer === dealer &&
+                this._isSmallTrumpCard(leadPattern, trumpSuit, level);
+
+            // 队友赢 → 开局庄家走小主牌时，队友应主动抢出牌权
+            // （庄家走小主牌就是想让队友上手，队友应该配合拿下出牌权）
             if (iAmWinning) {
+                if (dealerLeadingSmallTrump && this._isTeammate(leadPlayer)) {
+                    // 庄家走小主牌希望队友上手，队友应主动抢权
+                    // 但不出王（太珍贵），用稍大的主牌压过庄家
+                    const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+                    const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+                    for (const trump of trumps) {
+                        const val = getCardValue(trump, trumpSuit, level);
+                        if (val > winnerValue && !trump.isJoker && val < 213) {
+                            return [trump]; // 用稍大的非王主牌压过，拿下出牌权
+                        }
+                    }
+                    // 如果只能用王或级牌压，那就算了（庄家牌也不小）
+                }
+
+                // === 中盘主牌拦截策略 ===
+                // 到了中盘，庄家走小主牌单张，下家小跟，无分。
+                // 队友AI要至少出A来拦截，如果有单主牌A。
+                // 主牌拦截可用：A，所有级牌，甚至必要时用王。
+                // 但拆A对或级牌对要看是否想保留对子用来抠底/毙杀。
+                if (this._shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, null)) {
+                    const interceptTrump = this._findInterceptTrump(trumps, trickCards, trumpSuit, level);
+                    if (interceptTrump) return [interceptTrump];
+                }
+
                 return [trumps[0]];
             }
-            // 对手赢，看能不能赢
+
+            // 对手赢 → 看能不能赢
             const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
             const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
             // 最后一轮？（出完即结束）
             const isLastTrick = hand.length === leadPattern.length;
-            // 找最小的能赢的主牌
+
+            // 开局庄家走小主牌时，对手应更积极地抢出牌权
+            // 阻止庄家队友上手
+            if (dealerLeadingSmallTrump && !this._isTeammate(leadPlayer)) {
+                // 对手：庄家走小主牌，必须阻止队友上手
+                for (const trump of trumps) {
+                    const val = getCardValue(trump, trumpSuit, level);
+                    if (val > winnerValue) {
+                        // 尾盘非最后一轮 → 不出大王（留最后一轮主动出）
+                        if (!isLastTrick && this._isEndGame(hand) && trump.isJoker && trump.rank === 'big') {
+                            continue;
+                        }
+                        // 开局阶段不出王来抢一个小主牌（太浪费）
+                        if (trump.isJoker && this._isEarlyGame(hand)) {
+                            continue;
+                        }
+                        return [trump];
+                    }
+                }
+                // 赢不了，出最小主牌
+                return [trumps[0]];
+            }
+
+            // 找最小的能赢的主牌（原有逻辑）
             for (const trump of trumps) {
                 if (getCardValue(trump, trumpSuit, level) > winnerValue) {
                     // 尾盘非最后一轮 → 不出大王（留最后一轮主动出，"先出的大王大"）
@@ -1391,7 +1854,7 @@ class TractorAI {
         // 如果该花色牌数足够，正常跟牌
         if (leadSuitCards.length >= needLen) {
             if (leadPattern.type === 'single') {
-                return this._followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit);
+                return this._followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand);
             }
             if (leadPattern.type === 'pair') {
                 return this._followPair(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand);
@@ -1467,8 +1930,9 @@ class TractorAI {
      * - 队友出小牌赢且非最后一家：跟最小的非分牌（保留分牌给队友大牌时贴）
      * - 队友赢且最后一家：贴分牌（帮队友加分）
      * - 对手赢：出最大的牌试图赢；赢不了跟最小非分牌
+     * - 中盘拦截：队友出小牌赢时，用J/Q级牌拦截，防止最后一家跑10/5
      */
-    _followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit) {
+    _followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand) {
         if (iAmWinning) {
             // 判断队友出的是不是大牌（A或K）
             const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
@@ -1496,6 +1960,16 @@ class TractorAI {
                 }
                 // 没有分牌，跟最小的
                 return [leadSuitCards[0]];
+            }
+
+            // 队友出小牌赢，非最后一家
+            // === 中盘拦截策略 ===
+            // 庄家走小牌，下家小跟，无分。队友AI要用J/Q等中级牌拦截，
+            // 防止最后一家出10得分的可能性。不用A（中盘AK大概率走完了），
+            // 不用K（如果有K是最后一家的那是他的分，拦不住）。
+            if (this._shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, leadSuit)) {
+                const interceptCard = this._findInterceptCard(leadSuitCards, trumpSuit, level);
+                if (interceptCard) return [interceptCard];
             }
 
             // 队友出小牌，跟最小的非分牌（保留分牌给队友大牌时贴）
@@ -1895,19 +2369,26 @@ class TractorAI {
             return this._discardCards(nonTrumps, trumps, needLen);
         }
 
-        // 无分在桌上 → 50%杀主 / 50%垫牌（概率分支）
+        // 无分在桌上 → 根据是否需要出牌权决定杀主或垫牌
+        // 断门的核心价值：杀牌既拿分又抢出牌权。只要AI有强势牌要主动走
+        // （副牌A/大对子/拖拉机，或主牌强势想消耗对手主牌），就应该杀主抢权；
+        // 只有牌面无分且AI无强势牌可走时，才放弃杀牌垫副牌。
         if (trumps.length >= needLen && nonTrumps.length >= needLen) {
             // 先检查能否同型杀
             const canKill = (leadPattern.type === 'single') ||
                 (leadPattern.type === 'pair' && this._findPairs(trumps, trumpSuit, level).length > 0) ||
                 (leadPattern.type === 'tractor' && this._findTractors(trumps, trumpSuit, level).length > 0);
 
-            if (canKill && Math.random() < 0.5) {
-                // 杀主抢出牌权
-                const killCards = this._killWithTrump(trumps, leadPattern, trickCards, trumpSuit, level, needLen);
-                if (killCards) return killCards;
+            if (canKill) {
+                // 是否需要出牌权：有强势副牌要走，或主牌强势(对子/拖拉机)想上手主动出主消耗对手
+                const wantControl = this._wantControl(hand, trumpSuit, level, leadSuit);
+                const strongTrumpToLead = this._hasStrongTrumpToLead(trumps, hand, trumpSuit, level);
+                if (wantControl || strongTrumpToLead) {
+                    const killCards = this._killWithTrump(trumps, leadPattern, trickCards, trumpSuit, level, needLen);
+                    if (killCards) return killCards;
+                }
             }
-            // 垫副牌
+            // 无需出牌权或无法同型杀 → 垫副牌
             return this._discardCards(nonTrumps, trumps, needLen);
         }
 
@@ -2428,6 +2909,32 @@ class TractorAI {
         const pointCards = hand.filter(c => this._isPointCard(c) && !isTrump(c, trumpSuit, level));
         if (pointCards.length >= 3) return true;
 
+        return false;
+    }
+
+    /**
+     * 判断是否有强势主牌可以上手后主动打出（控场消耗策略）
+     *
+     * 主牌强势（有好几个对子甚至拖拉机，张数也多）时，上手后主动打出
+     * 强势主牌，让其他玩家主牌断门，建立"只有我有主牌"的控场优势。
+     * 此时断门杀牌抢出牌权非常有价值。
+     *
+     * @param {Array} trumps - 当前手牌中的主牌
+     * @param {Array} hand - 当前手牌
+     * @returns {boolean}
+     */
+    _hasStrongTrumpToLead(trumps, hand, trumpSuit, level) {
+        if (!trumps || trumps.length === 0) return false;
+        const pairs = this._findPairs(trumps, trumpSuit, level);
+        const tractors = this._findTractors(trumps, trumpSuit, level);
+        // 有拖拉机或2+对子，且主牌占手牌相当比例 → 强势主牌，值得抢权主动出主消耗
+        if ((tractors.length > 0 || pairs.length >= 2) && trumps.length >= hand.length * 0.4) {
+            return true;
+        }
+        // 主牌数量绝对优势（过半手牌是主）→ 主动出主消耗对手
+        if (trumps.length >= hand.length * 0.55 && trumps.length >= 8) {
+            return true;
+        }
         return false;
     }
 
