@@ -1242,7 +1242,7 @@ function showGameOverModal(result) {
     elements.gameoverModal.classList.add('show');
     
     // 检查整局游戏是否结束
-    const winner = game.checkGameOver();
+    const winner = game.checkGameOver(result);
     if (winner) {
         elements.nextGame.textContent = '新游戏';
         log(`======== 游戏结束！${winner === 'teamA' ? '我方' : '对方'}获胜！ ========`);
@@ -1255,7 +1255,7 @@ function showGameOverModal(result) {
 function nextGame() {
     elements.gameoverModal.classList.remove('show');
     
-    const winner = game.checkGameOver();
+    const winner = game.checkGameOver(game.lastRoundResult);
     if (winner) {
         // 重新开始
         game.reset();

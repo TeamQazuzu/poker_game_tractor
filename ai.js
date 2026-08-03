@@ -7,7 +7,23 @@
  * 2. 闲家队首家：出小牌过渡，或出长套副牌消耗庄家主牌
  * 3. 跟牌：必须跟同花色，有对跟对；队友赢时跟小牌或贴分，对手赢时出大牌或杀主
  * 4. 分牌管理：5、10、K是分牌，队友赢时贴分，对手赢时保留
+ *
+ * 截图建议增强：
+ * - DEBUG开关：设为true输出AI每一步决策日志
+ * - 甩错记忆：记录甩错的牌型，避免AI重复甩错
+ * - 随机性：多策略等分时随机选择，防止行为可预测
+ * - 终局策略：倒数5张牌考虑抠底保底
  */
+
+// 调试开关（截图建议：增加DEBUG开关，输出AI每一步的评分和选择理由）
+const DEBUG = false;
+
+// Node.js环境：从game.js引入所需常量和函数（浏览器环境自动忽略）
+if (typeof require !== 'undefined') {
+    const _g = require('./game.js');
+    // 将game.js的导出合并到全局作用域
+    Object.assign(global, _g);
+}
 
 class TractorAI {
     constructor(position) {
@@ -24,7 +40,12 @@ class TractorAI {
                 right: new Set(),
                 bottom: new Set()
             },
-            trickCount: 0        // 轮次计数（用于判断开局阶段）
+            trickCount: 0,       // 轮次计数（用于判断开局阶段）
+            failedThrows: [],    // 记录甩错的牌型（避免AI重复甩错）
+            teammateSmallTrumpLeads: 0,  // 队友首发出小主牌的次数
+            lastSmallTrumpLeadTrick: -1, // 上次记录小主牌首发的轮次（防重复计数）
+            bottomPoints: null,  // 底牌分数（庄家AI埋底后记录，用于判断是否需要保底策略）
+            dealer: null         // 当前庄家位置（由decidePlay同步）
         };
     }
 
@@ -80,6 +101,20 @@ class TractorAI {
      */
     _isPlayerVoid(player, suit) {
         return this.memory.suitVoid[player].has(suit);
+    }
+
+    /**
+     * 统计某玩家在某花色已出过的牌数（用于判断断门可能性）
+     * position: 1=首家 2=二家 3=三家 4=四家
+     */
+    _countSuitPlayedByPlayer(suit, position) {
+        const playerMap = { 1: 'bottom', 2: 'right', 3: 'top', 4: 'left' };
+        // 注：PLAYERS顺序是 bottom→right→top→left，对应1→2→3→4
+        // 但实际出牌顺序取决于首家，这里用近似统计：
+        // 统计该花色在已出牌历史中出现的总次数（粗略估计四家可能的走牌量）
+        return this.memory.playedCards.filter(c =>
+            !c.isJoker && c.suit === suit
+        ).length;
     }
 
     /**
@@ -172,10 +207,21 @@ class TractorAI {
     /**
      * 判断是否应该进行拦截
      *
-     * 拦截场景：到了中盘，庄家走小牌单张，下家小跟，无分。
+     * 【拦截介入时机规则】
+     * 拦截规则的介入时机以"庄家(队友)第一次走单张小主牌"为标志。
+     * 庄家第一次出小主牌后，被队友接手或被对手抢走出牌权——这一轮之后，
+     * 拦截规则才开始介入。庄家第一次走小主牌的这一轮本身不拦截，而是
+     * 用尽全力抢出牌权（因为第一次出牌权最重要，A和强势副牌=分数）。
+     *
+     * 因此：在尚未发生过"庄家第一次走小主牌后被抢权"的事件时
+     * （即 memory.teammateSmallTrumpLeads < 1），处于第一次出牌权争夺阶段，
+     * 此时应用尽全力抢出牌权，不做拦截，直接返回 false。
+     *
+     * 拦截场景（介入后）：中盘，庄家走小牌单张，下家小跟，无分。
      * 此时队友AI要用一张中级牌保证最后一家不轻松跑分。
      *
      * 条件：
+     *   0. 已过第一次出牌权争夺阶段（teammateSmallTrumpLeads >= 1）
      *   1. 中盘阶段（手牌7~17张）
      *   2. 桌上无分（trickScore === 0）
      *   3. 非最后一家（后面还有玩家可能跑分）
@@ -184,6 +230,13 @@ class TractorAI {
      * @returns {boolean}
      */
     _shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, leadSuit) {
+        // 【第一次出牌权争夺阶段不拦截】
+        // 庄家(队友)第一次走小主牌前/这一轮，应用尽全力抢出牌权，不拦截。
+        // 参考 memory.teammateSmallTrumpLeads：尚未发生首次小主牌首发被抢权事件时，不拦截。
+        if (!this.memory.teammateSmallTrumpLeads || this.memory.teammateSmallTrumpLeads < 1) {
+            return false;
+        }
+
         // 中盘才拦截
         if (!this._isMidGame(hand)) return false;
         // 有分不拦截（有分时该贴分贴分，该杀杀）
@@ -237,6 +290,69 @@ class TractorAI {
         }
 
         // 实在没有合适的拦截牌，返回null（走默认逻辑）
+        return null;
+    }
+
+    /**
+     * 三家单张拦截牌选择（用户补充策略）
+     *
+     * 用户策略："要么用绝对大牌上手比如黑桃A，若没有黑桃A，
+     *   至少要用黑桃JQ之类，防止第四家用黑桃10轻易得分。
+     *   第四家的黑桃K，本来就防不住，也就不必考虑防御。"
+     *
+     * 优先级：
+     *   1. A（绝对大牌上手）——不拆对
+     *   2. K（如果手里有K，压过二家的J/Q，防四家跑10）
+     *      注意：K是分牌，但在拦截场景下如果A/J/Q都拦不住，可用K
+     *   3. J/Q（中级拦截牌）
+     *   4. 7/8/9中最大的（勉强拦截）
+     *
+     * @param {Array} leadSuitCards - 该花色手牌（已排序小→大）
+     * @param {number} winnerValue - 当前赢家的牌值
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @returns {Object|null} 拦截牌，或null
+     */
+    _findSingleInterceptCard(leadSuitCards, winnerValue, trumpSuit, level) {
+        if (!leadSuitCards || leadSuitCards.length === 0) return null;
+
+        const pairs = this._findPairs(leadSuitCards, trumpSuit, level);
+        const isInPair = (card) => pairs.some(p => p.some(pc => pc.id === card.id));
+
+        // 1. 优先用A（绝对大牌上手）——不拆对
+        const ace = leadSuitCards.find(c => {
+            if (c.rank !== 'A') return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
+            return !isInPair(c);
+        });
+        if (ace) return ace;
+
+        // 2. 用K（分牌但在拦截场景可接受）——不拆对
+        const king = leadSuitCards.find(c => {
+            if (c.rank !== 'K') return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
+            return !isInPair(c);
+        });
+        if (king) return king;
+
+        // 3. 用J/Q拦截
+        const jq = leadSuitCards.find(c => {
+            if (c.rank !== 'J' && c.rank !== 'Q') return false;
+            if (this._isPointCard(c)) return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
+            return !isInPair(c);
+        });
+        if (jq) return jq;
+
+        // 4. 用7/8/9中最大的能赢的牌
+        const midCards = leadSuitCards.filter(c => {
+            if (this._isPointCard(c)) return false;
+            if (c.rank === 'A' || c.rank === 'K') return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
+            return ['7', '8', '9'].includes(c.rank);
+        });
+        if (midCards.length > 0) return midCards[midCards.length - 1];
+
         return null;
     }
 
@@ -305,11 +421,249 @@ class TractorAI {
 
         // 4. 最后考虑用王（小王优先，大王太珍贵）
         //    只有在中盘且无其他选择时才用
+        //    底牌≤5分时放宽：大王不必留给保底，可用于拦截
         const smallJoker = biggerTrumps.find(c => c.isJoker && c.rank === 'small');
         if (smallJoker) return smallJoker;
 
-        // 不用大王拦截（太珍贵，留给尾盘保底/抠底）
+        // 底牌≤5分时，大王也愿意用于拦截（不值得为保底留大王）
+        if (this._shouldSkipBottomProtection()) {
+            const bigJoker = biggerTrumps.find(c => c.isJoker && c.rank === 'big');
+            if (bigJoker) return bigJoker;
+        }
+
+        // 底牌>5分时不用大王拦截（太珍贵，留给尾盘保底/抠底）
         return null;
+    }
+
+    /**
+     * 三家后续小主牌拦截：用级牌/中级主牌拦截，不浪费大小王
+     *
+     * 用户策略："首家队友第二次开始出小单主牌，仅需用拦截的思路确保对手方不跑分即可"
+     * 主牌里可用作拦截的牌特别多，因为有很多级牌。
+     *
+     * 优先级（不用王！）：
+     *   1. 副级牌（单张，value=212）
+     *   2. 主级牌（单张，value=213）
+     *   3. 主花色大普通牌（A/K/Q，不拆对）
+     *   4. 其他能赢的中级主牌
+     *
+     * @param {Array} trumps - 主牌（已排序小→大）
+     * @param {number} winnerValue - 当前赢家的牌值
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 当前级别
+     * @param {boolean} isLastTrick - 是否最后一轮
+     * @param {Array} hand - 手牌
+     * @returns {Object|null} 拦截牌，或null
+     */
+    _findTrumpInterceptCard(trumps, winnerValue, trumpSuit, level, isLastTrick, hand) {
+        if (!trumps || trumps.length === 0) return null;
+
+        const pairs = this._findPairs(trumps, trumpSuit, level);
+        const isInPair = (card) => pairs.some(p => p.some(pc => pc.id === card.id));
+
+        const candidates = [];
+        for (const t of trumps) {
+            const val = getCardValue(t, trumpSuit, level);
+            if (val <= winnerValue) continue;
+
+            let priority = 0;
+            if (!t.isJoker && t.rank === level && t.suit !== trumpSuit) priority = 80; // 副级牌
+            else if (!t.isJoker && t.rank === level && t.suit === trumpSuit) priority = 70; // 主级牌
+            else if (!t.isJoker && t.rank === 'A') priority = 60; // 主花色A
+            else if (!t.isJoker && !this._isPointCard(t)) priority = val; // 其他非分主牌
+            else continue; // 跳过分牌和王
+
+            // 不拆对子
+            if (isInPair(t)) continue;
+
+            candidates.push({ card: t, priority });
+        }
+
+        if (candidates.length === 0) return null;
+        candidates.sort((a, b) => b.priority - a.priority);
+        return candidates[0].card;
+    }
+
+    /**
+     * 判断四家（对手）是否可能有分数牌
+     * 用于三家决策：是否需要压制二家
+     *
+     * 用户策略："除非牌面已经判断出，四家手中无分数牌，那可以放过"
+     *
+     * 判断依据：
+     *   1. 四家已断门 → 无同花色分牌
+     *   2. 分牌(5/10/K)已大量出过 → 可能没有了
+     *   3. 自己手里有很多分牌 → 对手可能没有了
+     *
+     * @param {Array} trickCards - 桌面牌
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @param {Array} hand - 手牌
+     * @param {string} leadPlayer - 首家
+     * @returns {boolean} true=可能有分牌（需压制），false=大概率无分牌（可放过）
+     */
+    _opponentLikelyHasScore(trickCards, trumpSuit, level, hand, leadPlayer) {
+        // 确定四家是谁
+        const players = ['bottom', 'right', 'top', 'left'];
+        const leadIdx = players.indexOf(leadPlayer);
+        const fourthPlayer = players[(leadIdx + 3) % 4];
+
+        // 如果是队友（不应该，但保险），默认需要压制
+        if (this._isTeammate(fourthPlayer)) return true;
+
+        const leadSuit = getLeadSuit(trickCards[0].cards, trumpSuit, level);
+
+        // 四家已断该花色 → 不可能用该花色分牌
+        // 但如果是主牌局，断门意味着可以杀主，仍可能有主牌分牌
+        if (leadSuit !== null && this._isPlayerVoid(fourthPlayer, leadSuit)) {
+            // 断门了，但如果手上有主牌分牌(主10/主K/主5)仍可能跑分
+            // 统计已出的主牌分牌
+            const playedTrumpScore = this.memory.playedCards.filter(c =>
+                isTrump(c, trumpSuit, level) && this._isPointCard(c)
+            ).length;
+            if (playedTrumpScore >= 6) return false; // 主牌分牌基本出完了
+            return true; // 仍可能有主牌分牌
+        }
+
+        // 统计该花色已出的分牌数（两副牌共8张：2x5, 2x10, 2xK = 6张分牌... 不对，2副x3种=6张）
+        // 实际：每副牌有5/10/K各1张，2副牌共6张分牌
+        const totalScoreCards = 6;
+        const playedScore = this.memory.playedCards.filter(c => {
+            if (c.isJoker) return false;
+            if (isTrump(c, trumpSuit, level)) return false;
+            if (leadSuit !== null && c.suit !== leadSuit) return false;
+            return this._isPointCard(c);
+        }).length;
+
+        // 自己手里的该花色分牌
+        const myScore = hand.filter(c => {
+            if (c.isJoker) return false;
+            if (isTrump(c, trumpSuit, level)) return false;
+            if (leadSuit !== null && c.suit !== leadSuit) return false;
+            return this._isPointCard(c);
+        }).length;
+
+        // 首家+二家出的分牌
+        const tableScore = trickCards.flatMap(t => t.cards).filter(c =>
+            !c.isJoker && !isTrump(c, trumpSuit, level) &&
+            (leadSuit === null || c.suit === leadSuit) &&
+            this._isPointCard(c)
+        ).length;
+
+        // 已出+自己手里+桌面的分牌
+        const accountedScore = playedScore + myScore + tableScore;
+        // 如果几乎所有分牌都已accounted for，四家可能没有了
+        if (accountedScore >= totalScoreCards - 1) return false;
+
+        return true;
+    }
+
+    /**
+     * 判断一张主牌是否为"强势主牌"（王或级牌）
+     */
+    _isStrongTrump(card, trumpSuit, level) {
+        if (card.isJoker) return true;
+        if (card.rank === level) return true; // 主级牌/副级牌
+        return false;
+    }
+
+    /**
+     * 统计两副牌中"强势主牌"（王+级牌）还有多少在外
+     * （未出过、不在自己手中、不在本轮桌面）。强势主牌共12张：4王+8级牌。
+     */
+    _countOutstandingStrongTrumps(trumpSuit, level, hand, trickCards) {
+        const isStrong = c => isTrump(c, trumpSuit, level) && this._isStrongTrump(c, trumpSuit, level);
+        const accounted = this.memory.playedCards.filter(isStrong).length
+            + (hand || []).filter(isStrong).length
+            + trickCards.flatMap(t => t.cards).filter(isStrong).length;
+        return Math.max(0, 12 - accounted);
+    }
+
+    /**
+     * 统计两副牌中比 winnerValue 更大的主牌还有多少"在外"
+     * （未出过、不在自己手中、不在本轮桌面）—— 可能在对手手中反超。
+     * 用于判断队友首发的主牌能否稳赢（如大王必然稳赢）。
+     */
+    _countOutstandingBiggerTrumps(winnerValue, trumpSuit, level, hand, trickCards) {
+        const isBigger = c => isTrump(c, trumpSuit, level) &&
+            getCardValue(c, trumpSuit, level) > winnerValue;
+        const accounted = this.memory.playedCards.filter(isBigger).length
+            + (hand || []).filter(isBigger).length
+            + trickCards.flatMap(t => t.cards).filter(isBigger).length;
+        let total = 0;
+        if (215 > winnerValue) total += 2; // 大王
+        if (214 > winnerValue) total += 2; // 小王
+        if (trumpSuit) {
+            if (213 > winnerValue) total += 2; // 主级牌
+            if (212 > winnerValue) total += 6; // 副级牌(3花色×2)
+            for (let v = 200; v <= 211; v++) {
+                if (v > winnerValue) total += 2; // 主花色普通牌(12个value各2张)
+            }
+        } else {
+            // 无主：所有级牌value=212，共8张
+            if (212 > winnerValue) total += 8;
+        }
+        return Math.max(0, total - accounted);
+    }
+
+    /**
+     * 判断二家（对手）是否"早已拿过出牌权、基本无强势牌"
+     * 用于三家决定是否可放过二家的杀牌。保守判断：仅当场上强势主牌基本出尽，
+     * 或二家本轮已用强势主牌杀且所剩强势主牌极少时，才认为二家无后续威胁。
+     */
+    _isSecondPlayerWeak(trickCards, trumpSuit, level, hand) {
+        const outstandingStrong = this._countOutstandingStrongTrumps(trumpSuit, level, hand, trickCards);
+        if (outstandingStrong === 0) return true; // 强势主牌已全部出尽，二家必无强势牌
+        const secondCards = trickCards.length >= 2 ? trickCards[1].cards : [];
+        const secondUsedStrong = secondCards.length > 0 && secondCards.some(c =>
+            isTrump(c, trumpSuit, level) && this._isStrongTrump(c, trumpSuit, level));
+        return secondUsedStrong && outstandingStrong <= 1;
+    }
+
+    /**
+     * 评估队友当前赢着的对子最终能否赢下来（用于非最后家决定是否配合跑分）
+     * 综合走牌历史：后续对手是否断门（可能杀主反超）、更大的同花色对子是否还在场上。
+     * @returns {boolean} true=大概率能赢（可配合跑分），false=有被反超风险（保守跟小牌）
+     */
+    _teammatePairLikelyWin(trickCards, trumpSuit, level, hand, leadSuit, leadPlayer, isLastPlayer) {
+        if (isLastPlayer) return true; // 最后家，已经赢了
+        const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+        const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+        const winnerIsTrump = isTrump(winner.cards[0], trumpSuit, level);
+        const players = ['bottom', 'right', 'top', 'left'];
+        const leadIdx = players.indexOf(leadPlayer);
+        const playedCount = trickCards.length;
+
+        let opponentRemains = false;
+        for (let i = playedCount; i < 4; i++) {
+            const p = players[(leadIdx + i) % 4];
+            if (this._isTeammate(p)) continue; // 队友不会反超自己人
+            opponentRemains = true;
+            // 对手断门 → 可能杀主反超
+            if (leadSuit !== null && this._isPlayerVoid(p, leadSuit)) {
+                return false;
+            }
+        }
+        if (!opponentRemains) return true; // 后续全是队友，稳赢
+
+        // 对手未断门：判断是否可能持有更大同花色对子
+        if (!winnerIsTrump && leadSuit !== null) {
+            const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
+            // winnerValue是副牌RANKS下标；逐个更大的rank检查该rank两张是否都在外
+            for (let v = winnerValue + 1; v <= 12; v++) {
+                if (RANKS[v] === level) continue; // 级牌成为主牌，不在副牌中
+                const rank = RANKS[v];
+                const accounted = this.memory.playedCards.filter(c =>
+                        !c.isJoker && c.suit === leadSuit && c.rank === rank).length
+                    + (hand || []).filter(c => !c.isJoker && c.suit === leadSuit && c.rank === rank).length
+                    + trickCards.flatMap(t => t.cards).filter(c =>
+                        !c.isJoker && c.suit === leadSuit && c.rank === rank).length;
+                if (2 - accounted >= 2) {
+                    return false; // 该rank两张都在外，对手可能凑成更大对子反超
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -323,6 +677,44 @@ class TractorAI {
         const val = getCardValue(card, trumpSuit, level);
         // 主花色普通小牌：200~208，不含级牌(212/213)和王(220+)
         return val >= 200 && val <= 208;
+    }
+
+    /**
+     * 抢出牌权：从主牌中选出最适合抢权的牌
+     * 优先用王/级牌等超强牌，确保对手难以反超
+     * 优先级：小王 > 大王(尾盘除外) > 主级牌 > 副级牌 > 最大可用主牌
+     *
+     * @param {Array} trumps - 已按value升序排列的主牌
+     * @param {number} winnerValue - 当前赢家的牌值
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 当前级别
+     * @param {boolean} isLastTrick - 是否最后一轮
+     * @param {Array} hand - 手牌（用于判断尾盘）
+     * @returns {Object|null} 最佳抢权牌，null表示争不过
+     */
+    _grabControlCard(trumps, winnerValue, trumpSuit, level, isLastTrick, hand) {
+        const candidates = [];
+        for (const t of trumps) {
+            const val = getCardValue(t, trumpSuit, level);
+            if (val <= winnerValue) continue; // 必须能赢当前赢家
+
+            let priority = 0;
+            if (t.isJoker && t.rank === 'small') priority = 100;
+            else if (t.isJoker && t.rank === 'big') priority = 99;
+            else if (!t.isJoker && t.rank === level && t.suit === trumpSuit) priority = 90;
+            else if (!t.isJoker && t.rank === level) priority = 80;
+            else priority = val;
+
+            // 尾盘非最后一轮：保留大王（底牌>5分时才需要保底留大王）
+            if (t.isJoker && t.rank === 'big' && !isLastTrick && this._isEndGame(hand) && !this._shouldSkipBottomProtection()) {
+                priority = -1;
+            }
+            candidates.push({ card: t, priority });
+        }
+
+        if (candidates.length === 0) return null;
+        candidates.sort((a, b) => b.priority - a.priority);
+        return candidates[0].card;
     }
 
     /**
@@ -744,35 +1136,44 @@ class TractorAI {
             }
         }
 
-        // 4c. 如果还不够8张（弱主牌不埋分牌导致不够），补充主牌小牌
+        // 4c. 警告：埋主牌的概率极低
+        //     埋底牌会削弱主牌控制力，正常情况下副牌（4a/4b）足以埋满8张。
+        //     只有副牌实在不够埋时才考虑埋主牌，且即使要埋，也只能埋
+        //     "非分、非对的小主牌"——绝不能埋分牌（埋底等于白送分）或对子
+        //     （对子是重要的控制资源，不能浪费在底牌里）。
         if (toBury.length < 8) {
-            const trumpCandidates = trumps
+            console.warn('[埋底] 副牌不足以埋满8张，需埋主牌补足——这种情况极少出现，仅埋非分非对小主牌');
+
+            // 收集主牌中的对子牌ID，这些牌受保护不能埋（保留对子控制资源）
+            const trumpPairs = this._findPairs(trumps, trumpSuit, level);
+            const pairCardIds = new Set();
+            for (const pair of trumpPairs) {
+                pairCardIds.add(pair[0].id);
+                pairCardIds.add(pair[1].id);
+            }
+
+            // 仅埋"非分、非对、非级牌非王"的小主牌，严格过滤
+            const safeTrumpCandidates = trumps
                 .filter(c => !usedIds.has(c.id))
+                .filter(c => !this._isPointCard(c))          // 绝不埋分牌
+                .filter(c => !pairCardIds.has(c.id))         // 绝不埋对子中的牌
+                .filter(c => getCardValue(c, trumpSuit, level) < 212) // 不埋级牌和王
                 .sort((a, b) => getCardValue(a, trumpSuit, level) - getCardValue(b, trumpSuit, level));
 
-            for (const card of trumpCandidates) {
+            for (const card of safeTrumpCandidates) {
                 if (toBury.length >= 8) break;
-                // 不埋大小王和主级牌
-                const val = getCardValue(card, trumpSuit, level);
-                if (val >= 212) continue; // 级牌和王不埋
                 toBury.push(card);
                 usedIds.add(card.id);
             }
         }
 
-        // 4d. 最后兜底：如果还不够8张，不管分牌了，埋任何能埋的
-        if (toBury.length < 8) {
-            const remaining = hand
-                .filter(c => !usedIds.has(c.id))
-                .sort((a, b) => getCardValue(a, trumpSuit, level) - getCardValue(b, trumpSuit, level));
-            for (const card of remaining) {
-                if (toBury.length >= 8) break;
-                toBury.push(card);
-                usedIds.add(card.id);
-            }
-        }
+        const buryCards = toBury.slice(0, 8);
 
-        return toBury.slice(0, 8);
+        // 记录底牌分数到memory，用于终局判断是否需要保底策略
+        // 底牌0分或5分时，拖拉机抠底/甩牌抠底概率极低，不值得损失当前利益去保底
+        this.memory.bottomPoints = buryCards.reduce((s, c) => s + this._getCardScore(c), 0);
+
+        return buryCards;
     }
 
     /**
@@ -848,12 +1249,87 @@ class TractorAI {
     decidePlay(hand, gameState, trickCards) {
         const { trumpSuit, level, dealer } = gameState;
         const isDealerTeam = this._isDealerTeam(dealer);
+        const position = this._getPosition(trickCards); // 1=首家, 2=次家, 3=三家, 4=四家
 
-        if (trickCards.length === 0) {
-            return this._leadPlay(hand, trumpSuit, level, isDealerTeam, dealer);
+        // 同步庄家位置到memory，供_findThrowOpportunity等函数使用
+        this.memory.dealer = dealer;
+
+        // 同步游戏状态的甩错记录到AI记忆
+        if (gameState.failedThrows && gameState.failedThrows.length > 0) {
+            this.memory.failedThrows = gameState.failedThrows.map(f => f);
         }
 
-        return this._followPlay(hand, trickCards, trumpSuit, level, isDealerTeam, dealer);
+        // 计算需要的出牌张数
+        const needLen = trickCards.length > 0 ? trickCards[0].cards.length : 1;
+
+        let result;
+        if (trickCards.length === 0) {
+            result = this._leadPlay(hand, trumpSuit, level, isDealerTeam, dealer);
+        } else {
+            result = this._followPlay(hand, trickCards, trumpSuit, level, isDealerTeam, dealer, position);
+        }
+
+        // === 安全验证：确保返回的牌合法且数量正确 ===
+        if (!result || result.length === 0) {
+            // 策略返回空或无效——不能掩盖问题，必须明确发出红字警报
+            const fmtCard = c => c ? (c.rank === 'big' ? '大王' : c.rank === 'small' ? '小王' : c.suit + c.rank) : '?';
+            const handStr = hand ? hand.map(fmtCard).join(',') : '无';
+            const trickStr = (trickCards && trickCards.length > 0)
+                ? trickCards.map(t => `${t.player}:${(t.cards || []).map(fmtCard).join(',')}`).join(' | ')
+                : '无(首家)';
+            const historyStr = (this.memory && this.memory.playedCards)
+                ? this.memory.playedCards.map(fmtCard).join(',') : '无';
+            console.error(
+                '%c[AI策略警报] 出牌策略返回空或无效！请测试人员明确排查并解决此问题（不可忽略）。\n' +
+                '--- 当前游戏状态 ---\n' +
+                `手牌(${hand ? hand.length : 0}张): ${handStr}\n` +
+                `桌面牌: ${trickStr}\n` +
+                `主花色: ${trumpSuit || '无'} | 级别: ${level || '无'} | 庄家: ${dealer || '无'} | 是否庄家方: ${isDealerTeam} | 座位: ${position} | 需要张数: ${needLen}\n` +
+                `已出牌历史: ${historyStr}`,
+                'color: red; font-weight: bold; font-size: 14px; background: #fff0f0;'
+            );
+            // 警报后仍返回最小牌以防崩溃（但不掩盖问题，错误信息已先行打印）
+            result = this._fallbackPlay(hand, needLen, trumpSuit, level);
+        }
+
+        // 过滤掉无效元素并用手中牌替换
+        const handIds = new Set(hand.map(c => c.id));
+        const validResult = [];
+        const usedIds = new Set();
+        for (const card of result) {
+            if (card && handIds.has(card.id) && !usedIds.has(card.id)) {
+                validResult.push(card);
+                usedIds.add(card.id);
+            }
+        }
+        // 如果有效牌不够，从手中补足
+        if (validResult.length < needLen) {
+            for (const card of hand) {
+                if (validResult.length >= needLen) break;
+                if (!usedIds.has(card.id)) {
+                    validResult.push(card);
+                    usedIds.add(card.id);
+                }
+            }
+        }
+        // 如果多了，截断
+        result = validResult.slice(0, needLen);
+
+        // 调试日志
+        if (result && result.length > 0) {
+            this._debug(`出牌: ${result.map(c => c ? (c.rank === 'big' ? '大王' : c.rank === 'small' ? '小王' : c.suit + c.rank) : '?').join(', ')}`);
+        }
+
+        return result;
+    }
+
+    /**
+     * 兜底出牌策略：当正常策略失败时使用
+     * 简单地出最小的牌
+     */
+    _fallbackPlay(hand, needLen, trumpSuit, level) {
+        const sorted = this._sortByValue([...hand], trumpSuit, level);
+        return sorted.slice(0, needLen);
     }
 
     // ================================================================
@@ -921,6 +1397,13 @@ class TractorAI {
      * 闲家方：抠底（赢最后一轮，底牌分数×倍数拿走）
      */
     _endGameLeadPlay(hand, trumps, suitGroups, trumpSuit, level, isDealerTeam) {
+        // 底牌≤5分时跳过保底留牌策略：
+        // 不再为大王留最后一轮、不刻意保留主牌大牌给保底用
+        // 交给常规出牌策略，按当前局势最优化出牌
+        if (this._shouldSkipBottomProtection()) {
+            return null;
+        }
+
         const bigJokerOut = this._bigJokersPlayed();
         const bigJokers = hand.filter(c => c.isJoker && c.rank === 'big');
         const smallJokers = hand.filter(c => c.isJoker && c.rank === 'small');
@@ -1363,17 +1846,14 @@ class TractorAI {
             if (smallTrump) return [smallTrump];
         }
         
-        // 3. 闲家队：出最长套的最小牌（消耗庄家主牌）
+        // 3. 闲家队：出小张单主过渡，让本方队友决定是否拿走出牌权
+        //    （原策略出最长套最小牌必然送给庄家方杀牌，反而帮庄家消耗小主；
+        //     改为出小单张主牌过渡——本方队友可凭更大主牌决定是否抢权，
+        //     而非必然把出牌权交给庄家方。主牌过少时仍走兜底出副牌。）
         if (!isDealerTeam) {
-            let longestSuit = null, longestLen = 0;
-            for (const suit of Object.keys(suitGroups)) {
-                if (suitGroups[suit].length > longestLen) {
-                    longestLen = suitGroups[suit].length;
-                    longestSuit = suit;
-                }
-            }
-            if (longestSuit && longestLen > 0) {
-                return [suitGroups[longestSuit][0]];
+            if (trumps.length >= 2) {
+                const smallTrump = this._findBestSmallTrump(trumps, trumpSuit, level);
+                if (smallTrump) return [smallTrump];
             }
         }
         
@@ -1453,9 +1933,10 @@ class TractorAI {
         // 3d. 甩牌
         const throwCards = this._findThrowOpportunity(suitGroups, trumpSuit, level, hand);
         if (throwCards) {
+            const throwSuit = throwCards[0].suit;
             plays.push({ 
                 cards: throwCards, strength: 92, type: 'throw', 
-                suit: throwCards[0].suit, suitLen: suitGroups[throwCards[0].suit].length 
+                suit: throwSuit, suitLen: (suitGroups[throwSuit] || []).length 
             });
         }
         
@@ -1498,12 +1979,16 @@ class TractorAI {
     _findThrowOpportunity(suitGroups, trumpSuit, level, hand) {
         const throwOpportunities = [];
 
+        // 1. 检查副牌甩牌机会
         for (const suit of Object.keys(suitGroups)) {
             const cards = suitGroups[suit];
             if (cards.length < 2) continue; // 1张牌不算甩牌（就是单张）
 
             // 检查该花色的所有牌是否都是市面上最大的
             if (isThrowValid(cards, trumpSuit, level, this.memory.playedCards)) {
+                // 检查是否曾经甩错过该牌型
+                if (this._hasFailedThrow(cards, trumpSuit, level)) continue;
+
                 // 计算甩牌的价值（含分牌越多越好，张数越多越好）
                 const pointValue = cards.reduce((s, c) => s + this._getCardScore(c), 0);
                 throwOpportunities.push({
@@ -1512,6 +1997,34 @@ class TractorAI {
                     count: cards.length,
                     pointValue: pointValue
                 });
+            }
+        }
+
+        // 2. 检查主牌甩牌机会（主牌甩牌仅限两种情况）
+        //    a) 闲家最后一手主牌合法全甩，获得抠底高翻倍的机会
+        //    b) 庄家控场清空了其他家的主牌，自己手中全是主牌，快速结束本局
+        //    底牌≤5分时跳过情况b：拖拉机抠底/甩牌抠底概率极低，不值得为此快速结束
+        const trumps = hand.filter(c => isTrump(c, trumpSuit, level));
+        if (trumps.length >= 2 && isThrowValid(trumps, trumpSuit, level, this.memory.playedCards)) {
+            if (!this._hasFailedThrow(trumps, trumpSuit, level)) {
+                // 判断是否满足主牌甩牌条件
+                const isLastHand = hand.length === trumps.length; // 手中全是主牌
+                const isEndgame = hand.length <= 6; // 尾盘阶段
+                const isDealerTeam = this.memory.dealer ? this._isDealerTeam(this.memory.dealer) : false;
+
+                // 情况a：最后一手全主牌（无论庄闲都允许，这是自然出牌）
+                // 情况b：庄家尾盘控场全主牌快速结束（底牌≤5分时跳过，不值得保底）
+                const skipDealerThrow = this._shouldSkipBottomProtection();
+                if (isLastHand || (!skipDealerThrow && isDealerTeam && isEndgame && trumps.length >= hand.length)) {
+                    const pointValue = trumps.reduce((s, c) => s + this._getCardScore(c), 0);
+                    // 主牌甩牌价值更高（毙杀难度大）
+                    throwOpportunities.push({
+                        cards: trumps,
+                        suit: 'trump',
+                        count: trumps.length,
+                        pointValue: pointValue + 50 // 主牌甩牌额外加分
+                    });
+                }
             }
         }
 
@@ -1524,6 +2037,15 @@ class TractorAI {
             // 再按分牌降序
             return b.pointValue - a.pointValue;
         });
+
+        // 截图建议：多个策略评分相等时，引入随机选择
+        const top = throwOpportunities.filter(o =>
+            o.count === throwOpportunities[0].count &&
+            o.pointValue === throwOpportunities[0].pointValue
+        );
+        if (top.length > 1) {
+            return this._pickRandom(top).cards;
+        }
 
         return throwOpportunities[0].cards;
     }
@@ -1609,11 +2131,20 @@ class TractorAI {
     //  跟牌策略
     // ================================================================
 
-    _followPlay(hand, trickCards, trumpSuit, level, isDealerTeam, dealer) {
+    _followPlay(hand, trickCards, trumpSuit, level, isDealerTeam, dealer, position) {
         const leadCards = trickCards[0].cards;
         const leadPattern = getCardPattern(leadCards, trumpSuit, level, this.memory.playedCards);
         const leadSuit = getLeadSuit(leadCards, trumpSuit, level);
         const leadPlayer = trickCards[0].player;
+
+        // === 追踪队友首发出小主牌的次数 ===
+        // 用户策略："首家队友第一次出小单主牌→用大小王抢权；第二次开始→仅需拦截防跑分"
+        if (this._isTeammate(leadPlayer) && leadSuit === null &&
+            this._isSmallTrumpCard(leadCards, trumpSuit, level) &&
+            this.memory.lastSmallTrumpLeadTrick !== this.memory.trickCount) {
+            this.memory.teammateSmallTrumpLeads++;
+            this.memory.lastSmallTrumpLeadTrick = this.memory.trickCount;
+        }
 
         // 判断当前谁在赢
         const currentWinner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
@@ -1627,6 +2158,43 @@ class TractorAI {
         // 判断是否是最后一家（第4个出牌）
         const isLastPlayer = trickCards.length === 3;
 
+        // 位置感知策略调整（基于tractor_AI文档）
+        // position: 2=次家(对手，灵活), 3=三家(队友最后一手), 4=四家(决定胜负)
+        // 次家(2)更灵活，可以保守跟牌等队友(4)补救
+        // 三家(3)是本方最后一手，需要考虑是否跑分或抢权
+        // 四家(4)决定胜负，出牌权争夺最关键
+
+        // 终局阶段：考虑抠底保底策略
+        // AI文档："应该在倒数剩5张牌开始，战略性考虑抠底保底的策略"
+        // 底牌≤5分时跳过保底策略：拖拉机抠底/甩牌抠底概率极低，不值得损失当前利益
+        const skipBottomStrategy = this._shouldSkipBottomProtection();
+        const isBottomPhase = this._isBottomGamePhase(hand);
+        const isLastHand = hand.length === leadPattern.length;
+
+        // === 终局策略：最后一手牌的保底/抠底 ===
+        // 最后一手牌的赢家获得底牌分数（倍数由牌型决定）
+        // 庄家方必须赢最后一手保底，闲家方要赢最后一手抠底
+        // 底牌≤5分时：函数内部会跳过保底杀牌，但保留队友在赢时跑分的逻辑
+        if (isLastHand) {
+            const bottomResult = this._bottomPhaseLastHand(
+                hand, trumps, leadPattern, leadSuit, trickCards, iAmWinning,
+                trickScore, trumpSuit, level, isDealerTeam, isLastPlayer
+            );
+            if (bottomResult) return bottomResult;
+        }
+
+        // === 终局策略：倒数几手的出牌权争夺 ===
+        // 庄家方：不惜代价赢牌，防止闲家拿到最后一手出牌权
+        // 闲家方：用大王/小王抢出牌权，为最后一手多张牌抠底做准备
+        // 底牌≤5分时跳过：不值得为此消耗主牌大牌
+        if (isBottomPhase && !iAmWinning && !isLastHand && !skipBottomStrategy) {
+            const bottomResult = this._bottomPhaseProtect(
+                hand, trumps, leadPattern, leadSuit, trickCards, trickScore,
+                trumpSuit, level, isDealerTeam, isLastPlayer
+            );
+            if (bottomResult) return bottomResult;
+        }
+
         // === 甩牌的特殊跟牌处理 ===
         // 甩牌跟牌规则：
         //   - 必须跟数量相同的牌
@@ -1638,7 +2206,7 @@ class TractorAI {
 
         // === 首家出的是主牌 ===
         if (leadSuit === null) {
-            return this._followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadPlayer, dealer);
+            return this._followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadPlayer, dealer, position);
         }
 
         // === 首家出的是副牌花色 ===
@@ -1650,17 +2218,24 @@ class TractorAI {
         const hasLeadSuit = leadSuitCards.length > 0;
 
         if (hasLeadSuit) {
-            return this._followSuit(leadSuitCards, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, hand, isDealerTeam, isLastPlayer, leadSuit);
+            return this._followSuit(leadSuitCards, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, hand, isDealerTeam, isLastPlayer, leadSuit, position, leadPlayer);
         }
 
         // 没有首家花色 → 杀主或垫牌
-        return this._followNoSuit(trumps, hand, leadPattern, trickCards, iAmWinning, trickScore, trumpSuit, level, isDealerTeam, isLastPlayer, leadSuit);
+        return this._followNoSuit(trumps, hand, leadPattern, trickCards, iAmWinning, trickScore, trumpSuit, level, isDealerTeam, isLastPlayer, leadSuit, position, leadPlayer);
     }
 
     /**
      * 跟主牌
+     *
+     * 位置感知策略（tractor_AI文档）：
+     *   position 2（次家）：对手，灵活，队友四家可补救
+     *   position 3（三家）：队友（对门）是首家，本方最后一手，胜负关系大
+     *     - 队友赢且二家没杀 → 跑分（10>K>5），无分跟小牌
+     *     - 二家杀了 → 尝试用更大主牌反杀，不能反杀则跟小牌
+     *   position 4（四家）：决定胜负，出牌权争夺最关键
      */
-    _followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadPlayer, dealer) {
+    _followTrump(trumps, hand, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadPlayer, dealer, position) {
         const needLen = leadPattern.length;
 
         // 主牌不够，尽量出主牌，不够的用副牌补足
@@ -1689,92 +2264,179 @@ class TractorAI {
         }
 
         if (leadPattern.type === 'single') {
-            // === 开局策略：庄家走小单主牌让队友上手 ===
-            // 庄家开局走小单主牌的意图是让队友上手，队友应主动抢出牌权
-            // 对手则应阻止庄家队友上手
-            const dealerLeadingSmallTrump = this._isEarlyGame(hand) &&
-                leadPlayer === dealer &&
-                this._isSmallTrumpCard(trickCards[0].cards, trumpSuit, level);
+            const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+            const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+            const winnerIsTeammate = this._isTeammate(winner.player);
+            const isLastTrick = hand.length === leadPattern.length;
+            const leadIsSmallTrump = this._isSmallTrumpCard(trickCards[0].cards, trumpSuit, level);
+            const leadIsJoker = trickCards[0].cards[0].isJoker;
 
-            // 队友赢 → 开局庄家走小主牌时，队友应主动抢出牌权
-            // （庄家走小主牌就是想让队友上手，队友应该配合拿下出牌权）
-            if (iAmWinning) {
-                if (dealerLeadingSmallTrump && this._isTeammate(leadPlayer)) {
-                    // 庄家走小主牌希望队友上手，队友应主动抢权
-                    // 用最大或次大主牌压过，确保拿下出牌权（小主牌抢不到）
-                    const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
-                    const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
-                    // 收集所有能赢庄家的非王主牌，取最大的确保抢权
-                    const winningTrumps = [];
-                    for (const trump of trumps) {
-                        const val = getCardValue(trump, trumpSuit, level);
-                        if (val > winnerValue && !trump.isJoker) {
-                            winningTrumps.push(trump);
-                        }
-                    }
-                    if (winningTrumps.length > 0) {
-                        return [winningTrumps[winningTrumps.length - 1]]; // 最大的
-                    }
-                    // 如果只能用王压，那就算了（庄家牌也不小）
+            // ================================================================
+            // 次家（position=2）：对手是首家，队友在四家可补救，出牌灵活
+            // AI文档："次家出牌较为灵活，因为第四个出牌的队友还能有扭转乾坤的可能性"
+            // ================================================================
+            if (position === 2) {
+                if (winnerIsTeammate) {
+                    // 首家是对手，但队友不可能在赢（次家时只有首家出过牌）
+                    // 此分支不该到达，保险处理
+                    return [trumps[0]];
                 }
-
-                // === 中盘主牌拦截策略 ===
-                // 到了中盘，庄家走小主牌单张，下家小跟，无分。
-                // 队友AI要至少出A来拦截，如果有单主牌A。
-                // 主牌拦截可用：A，所有级牌，甚至必要时用王。
-                // 但拆A对或级牌对要看是否想保留对子用来抠底/毙杀。
-                if (this._shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, null)) {
-                    const interceptTrump = this._findInterceptTrump(trumps, trickCards, trumpSuit, level);
-                    if (interceptTrump) return [interceptTrump];
+                // 首家（对手）在赢
+                // 对手走小主牌 → 可以跟小主牌交给四家队友管理，或直接抢权
+                // 对手走大主牌 → 跟小主牌保留实力
+                if (leadIsSmallTrump) {
+                    // 对手走小主牌，自己可以跟非分小主牌交给队友
+                    // 也可以直接上大牌抢权（如果有A/级牌等强势主牌）
+                    const nonPointTrumps = trumps.filter(c => !this._isPointCard(c));
+                    if (nonPointTrumps.length > 0) {
+                        return [nonPointTrumps[0]]; // 跟最小非分主牌
+                    }
+                    return [trumps[0]];
                 }
-
+                // 对手走大主牌或王 → 跟最小主牌
                 return [trumps[0]];
             }
 
-            // 对手赢 → 看能不能赢
-            const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
-            const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
-            // 最后一轮？（出完即结束）
-            const isLastTrick = hand.length === leadPattern.length;
+            // ================================================================
+            // 三家（position=3）：对门（队友）是首家，本方最后一手
+            // AI文档："自己走的牌是本方最后一手，本轮胜负自己可能有较大关系"
+            // ================================================================
+            if (position === 3 && this._isTeammate(leadPlayer)) {
+                // 首家是队友，关键区分：队友出的是小主牌 vs 大主牌 vs 王
 
-            // 开局庄家走小主牌时，对手应更积极地抢出牌权
-            // 阻止庄家队友上手
-            if (dealerLeadingSmallTrump && !this._isTeammate(leadPlayer)) {
-                // 对手：庄家走小主牌，必须阻止队友上手
+                if (leadIsSmallTrump) {
+                    const leadCount = this.memory.teammateSmallTrumpLeads;
+
+                    // ★ 第一次出小主牌：用大小王等级强牌抢出牌权
+                    // AI文档："若首家第一次出小单主牌，需用大小王等级的强牌努力争取出牌权。争不过那没办法。"
+                    if (leadCount <= 1) {
+                        const grabCard = this._grabControlCard(trumps, winnerValue, trumpSuit, level, isLastTrick, hand);
+                        if (grabCard) {
+                            const label = grabCard.isJoker
+                                ? (grabCard.rank === 'big' ? '大王' : '小王')
+                                : (grabCard.rank === level ? '级牌' : '大主牌');
+                            this._debug(`三家：队友首次出小主牌，用${label}抢出牌权`);
+                            return [grabCard];
+                        }
+                        this._debug(`三家：队友首次出小主牌，争不过，跟最小主牌`);
+                        return [trumps[0]];
+                    }
+
+                    // ★ 第二次开始出小主牌：仅需拦截思路，确保对手方不跑分
+                    // 用户策略："首家队友第二次开始出小单主牌，仅需用拦截的思路确保对手方不跑分即可"
+                    // 不再浪费大小王，用级牌/中级主牌拦截即可
+                    const interceptCard = this._findTrumpInterceptCard(
+                        trumps, winnerValue, trumpSuit, level, isLastTrick, hand);
+                    if (interceptCard) {
+                        this._debug(`三家：队友后续出小主牌，拦截防跑分`);
+                        return [interceptCard];
+                    }
+                    // 拦截不了 → 跟最小主牌
+                    this._debug(`三家：队友后续出小主牌，拦不住，跟最小主牌`);
+                    return [trumps[0]];
+                }
+
+                // 队友出的是大主牌或王
+                if (winnerIsTeammate) {
+                    // 二家没杀，队友在赢
+                    // 除非队友首发的是绝对大牌（如大王，场上无更大主牌），否则需结合第四家实力
+                    // 确认队友真能赢才加分；无法确定四家是否反超时跟小牌或小分，保留大牌大分。
+                    const outstandingBigger = this._countOutstandingBiggerTrumps(
+                        winnerValue, trumpSuit, level, hand, trickCards);
+                    if (outstandingBigger === 0) {
+                        // 确认队友稳赢（大王，或更大的主牌均已出尽）→ 跑分
+                        // AI文档："加分数跑分，优先跑10，其次跑K，最次跑5"
+                        const runCard = this._getRunScoreCard(trumps);
+                        if (runCard) {
+                            this._debug(`三家：队友大主牌稳赢（无更大主牌在外），跑主牌分${runCard.rank}`);
+                            return [runCard];
+                        }
+                        // 无分 → 跟最小主牌
+                        return [trumps[0]];
+                    }
+                    // 无法确定四家能否反超 → 跟小牌或小分（保留大牌大分）
+                    this._debug(`三家：队友大主牌但四家可能反超，跟小牌/小分`);
+                    const nonScoreTrumps = trumps.filter(c => !this._isPointCard(c));
+                    if (nonScoreTrumps.length > 0) return [nonScoreTrumps[0]];
+                    const discardScore = this._getDiscardScoreCard(trumps);
+                    return [discardScore || trumps[0]];
+                }
+
+                // 二家杀了（对手在赢）→ 应尽力压制二家
+                // 除非同时满足：①二家早已拿过出牌权且基本无强势牌；②四家明确无分可跑，才可放过
+                // 用户策略："三家只要可能，必须出级牌或王牌，压过二家"，避免四家轻易加分
+                const fourthHasScore = this._opponentLikelyHasScore(
+                    trickCards, trumpSuit, level, hand, leadPlayer);
+                const secondPlayerWeak = this._isSecondPlayerWeak(trickCards, trumpSuit, level, hand);
+                if (!fourthHasScore && secondPlayerWeak) {
+                    // 四家明确无分可跑，且二家已无强势牌 → 放过，跟最小主牌
+                    this._debug(`三家：对手杀主，二家已无强势且四家无分，放过`);
+                    return [trumps[0]];
+                }
+                // 否则尽力压制二家！用强牌反杀
+                const killCard = this._grabControlCard(trumps, winnerValue, trumpSuit, level, isLastTrick, hand);
+                if (killCard) {
+                    this._debug(`三家：对手杀主，尽力压制二家`);
+                    return [killCard];
+                }
+                // 压制不了 → 跟最小主牌
+                return [trumps[0]];
+            }
+
+            // ================================================================
+            // 三家但首家是对手（非对门）→ 通用跟牌
+            // ================================================================
+            if (position === 3 && !this._isTeammate(leadPlayer)) {
+                if (winnerIsTeammate) {
+                    // 队友（二家）杀了对手的首牌 → 跑分
+                    const runCard = this._getRunScoreCard(trumps);
+                    if (runCard) {
+                        this._debug(`三家：队友二家杀，跑分`);
+                        return [runCard];
+                    }
+                    return [trumps[0]];
+                }
+                // 对手在赢 → 尝试赢回来（四家对手还在后面，用强牌抢权）
+                const grabCard2 = this._grabControlCard(trumps, winnerValue, trumpSuit, level, isLastTrick, hand);
+                if (grabCard2) {
+                    this._debug(`三家：对手赢，抢权`);
+                    return [grabCard2];
+                }
+                return [trumps[0]];
+            }
+
+            // ================================================================
+            // 四家（position=4）：决定胜负，出牌权争夺最关键
+            // AI文档："本轮走牌要在自己这里分出胜负，自己的决策就十分重要"
+            // ================================================================
+            if (position === 4) {
+                if (winnerIsTeammate) {
+                    // 队友赢 → 跑分
+                    const runCard = this._getRunScoreCard(trumps);
+                    if (runCard) {
+                        this._debug(`四家：队友赢，跑主牌分${runCard.rank}`);
+                        return [runCard];
+                    }
+                    // 无分 → 跟最小主牌
+                    return [trumps[0]];
+                }
+                // 对手赢 → 最后机会，必须想办法赢回来
                 for (const trump of trumps) {
-                    const val = getCardValue(trump, trumpSuit, level);
-                    if (val > winnerValue) {
-                        // 尾盘非最后一轮 → 不出大王（留最后一轮主动出）
-                        if (!isLastTrick && this._isEndGame(hand) && trump.isJoker && trump.rank === 'big') {
+                    if (getCardValue(trump, trumpSuit, level) > winnerValue) {
+                        // 尾盘非最后一轮保留大王（底牌>5分时才需要保底留大王）
+                        if (!isLastTrick && this._isEndGame(hand) &&
+                            trump.isJoker && trump.rank === 'big' && !this._shouldSkipBottomProtection()) {
                             continue;
                         }
-                        // 开局阶段不出王来抢一个小主牌（太浪费）
-                        if (trump.isJoker && this._isEarlyGame(hand)) {
-                            continue;
-                        }
+                        this._debug(`四家：对手赢，抢权`);
                         return [trump];
                     }
                 }
-                // 赢不了，出最小主牌
+                // 赢不了 → 跟最小主牌
                 return [trumps[0]];
             }
 
-            // 找最小的能赢的主牌（原有逻辑）
-            for (const trump of trumps) {
-                if (getCardValue(trump, trumpSuit, level) > winnerValue) {
-                    // 尾盘非最后一轮 → 不出大王（留最后一轮主动出，"先出的大王大"）
-                    // 中盘有分时仍可用大王赢分
-                    if (!isLastTrick && this._isEndGame(hand) && trump.isJoker && trump.rank === 'big') {
-                        continue;
-                    }
-                    // 中盘无分且唯一能赢的是王 → 保留
-                    if (trump.isJoker && !this._isEndGame(hand) && trickScore === 0) {
-                        break;
-                    }
-                    return [trump];
-                }
-            }
-            // 赢不了，出最小主牌
+            // 默认兜底
             return [trumps[0]];
         }
 
@@ -1837,16 +2499,16 @@ class TractorAI {
      * 如果该花色牌不够（如首家出拖拉机4张，我只有3张该花色），
      * 必须出全部该花色的牌，再用其他花色的牌补足。
      */
-    _followSuit(leadSuitCards, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, hand, isDealerTeam, isLastPlayer, leadSuit) {
+    _followSuit(leadSuitCards, leadPattern, iAmWinning, trickScore, trumpSuit, level, trickCards, hand, isDealerTeam, isLastPlayer, leadSuit, position, leadPlayer) {
         const needLen = leadPattern.length;
 
         // 如果该花色牌数足够，正常跟牌
         if (leadSuitCards.length >= needLen) {
             if (leadPattern.type === 'single') {
-                return this._followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand);
+                return this._followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand, position, leadPlayer);
             }
             if (leadPattern.type === 'pair') {
-                return this._followPair(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand);
+                return this._followPair(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand, position, leadPlayer);
             }
             if (leadPattern.type === 'tractor') {
                 return this._followTractor(leadSuitCards, leadPattern.length, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit);
@@ -1914,88 +2576,190 @@ class TractorAI {
 
     /**
      * 跟单张副牌
-     * 策略：
-     * - 队友出大牌（如A）赢时：贴分牌跑分（10或K），无论是否最后一家
-     * - 队友出小牌赢且非最后一家：跟最小的非分牌（保留分牌给队友大牌时贴）
-     * - 队友赢且最后一家：贴分牌（帮队友加分）
-     * - 对手赢：出最大的牌试图赢；赢不了跟最小非分牌
-     * - 中盘拦截：队友出小牌赢时，用J/Q级牌拦截，防止最后一家跑10/5
+     *
+     * 位置感知策略（tractor_AI文档 + 用户补充）：
+     *
+     * 【三家 position=3，对门（队友）是首家】——本方最后一手，胜负关系大
+     *   队友首发大单副牌：
+     *     - 二家未毙杀 → 加分数跑分（10>K>5），无分跟小牌
+     *     - 二家已毙杀 → 跟随非分小牌
+     *   队友首发小单（非绝对大牌）：
+     *     - 二家跟非大牌 → 拦截：用A上手，无A用J/Q防四家跑10
+     *     - 二家跟大牌（如A）→ 压制：用更大牌压过二家，防四家加10/K
+     *       除非四家已明确无分牌 → 放过
+     *
+     * 【通用策略（position 2/4 或首家非队友）】
+     *   - 队友出大牌赢时：贴分牌跑分
+     *   - 队友出小牌赢且非最后一家：拦截/跟最小非分牌
+     *   - 队友赢且最后一家：贴分牌
+     *   - 对手赢：出最大的牌试图赢；赢不了跟最小非分牌
      */
-    _followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand) {
+    _followSingle(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand, position, leadPlayer) {
+        const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+        const winnerCard = winner.cards[0];
+        const winnerValue = getCardValue(winnerCard, trumpSuit, level);
+
+        // ================================================================
+        // 三家（position=3），对门（队友）是首家——专属策略
+        // ================================================================
+        if (position === 3 && this._isTeammate(leadPlayer) && !isLastPlayer) {
+            // 判断队友出的是大单副牌还是小单
+            const leadCard = trickCards[0].cards[0];
+            const leadValue = getCardValue(leadCard, trumpSuit, level);
+            const teammatePlayedBig = leadValue >= 11; // A=11
+
+            // 判断二家是否毙杀（二家是position 2，trickCards[1]）
+            const secondPlayerCards = trickCards.length >= 2 ? trickCards[1].cards : [];
+            const secondKilled = secondPlayerCards.length > 0 &&
+                secondPlayerCards.some(c => isTrump(c, trumpSuit, level));
+            const secondCard = secondPlayerCards.length > 0 ? secondPlayerCards[0] : null;
+            const secondCardValue = secondCard ? getCardValue(secondCard, trumpSuit, level) : 0;
+            const secondPlayedBig = secondCardValue >= 11; // 二家跟了大牌（A）
+
+            // --- 队友首发大单副牌 ---
+            if (teammatePlayedBig) {
+                if (!secondKilled) {
+                    // 二家未毙杀 → 判断四家断门毙杀的可能性再决定是否加分
+                    // 强化判断：四家该花色走牌≤3张时，基本不太会断门
+                    const fourthPlayedCount = this._countSuitPlayedByPlayer(leadSuit, 4);
+                    const fourthLikelyVoid = fourthPlayedCount > 3; // 走牌>3张才有可能断门
+
+                    if (fourthLikelyVoid) {
+                        // 四家可能断门毙杀 → 谨慎，跟小牌或小分
+                        this._debug(`三家：队友大牌赢，但四家可能断门，谨慎跟小牌`);
+                        const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+                        if (nonPoint.length > 0) return [nonPoint[0]];
+                        // 只有分牌时跟最小分
+                        const discardCard = this._getDiscardScoreCard(leadSuitCards);
+                        return [discardCard || leadSuitCards[0]];
+                    }
+
+                    // 四家不太可能断门 → 加分数跑分（优先10>K>5）
+                    const runCard = this._getRunScoreCard(leadSuitCards);
+                    if (runCard) {
+                        this._debug(`三家：队友大牌赢，四家不太会断门，跑分${runCard.rank}`);
+                        return [runCard];
+                    }
+                    // 无分 → 跟本门小牌
+                    const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+                    if (nonPoint.length > 0) return [nonPoint[0]];
+                    return [leadSuitCards[0]];
+                }
+                // 二家已毙杀 → 跟随非分小牌
+                // 若二家出了绝对大牌（如A），自己压制不住，除非断门——断门时必须毙杀
+                const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+                if (nonPoint.length > 0) return [nonPoint[0]];
+                // 全是分牌 → 垫最小分牌
+                const discardCard = this._getDiscardScoreCard(leadSuitCards);
+                return [discardCard || leadSuitCards[0]];
+            }
+
+            // --- 队友首发小单（非绝对大牌）---
+            // 用户策略："队友首发出小单（包括所有非绝对大牌），比如副牌黑桃4"
+            if (!secondKilled && secondCard) {
+                // 二家跟了牌（未毙杀）
+                if (!secondPlayedBig) {
+                    // 二家跟的不是绝对大牌（如黑桃8）→ 拦截！
+                    // 用户策略："要么用绝对大牌上手比如黑桃A，若没有黑桃A，
+                    //   至少要用黑桃JQ之类，防止第四家用黑桃10轻易得分"
+                    //   "第四家的黑桃K，本来就防不住，也就不必考虑防御"
+                    const interceptCard = this._findSingleInterceptCard(
+                        leadSuitCards, winnerValue, trumpSuit, level);
+                    if (interceptCard) {
+                        this._debug(`三家：队友小牌，二家非大牌，拦截防四家跑10`);
+                        return [interceptCard];
+                    }
+                    // 没有合适的拦截牌 → 跟最小非分牌
+                    const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+                    if (nonPoint.length > 0) return [nonPoint[0]];
+                    const discardCard = this._getDiscardScoreCard(leadSuitCards);
+                    return [discardCard || leadSuitCards[0]];
+                }
+
+                // 二家跟了大牌（如A）→ 压制！
+                // 用户策略："队友首发主牌红桃4，二家跟红桃A，作为三家，只要可能，
+                //   必须出级牌或王牌，压过二家，避免四家直接加10或K得分"
+                //   "除非牌面已经判断出，四家手中无分数牌，那可以放过"
+                const fourthHasScore = this._opponentLikelyHasScore(
+                    trickCards, trumpSuit, level, hand, leadPlayer);
+                if (fourthHasScore) {
+                    // 四家可能有分牌 → 必须压制二家
+                    for (let i = leadSuitCards.length - 1; i >= 0; i--) {
+                        if (getCardValue(leadSuitCards[i], trumpSuit, level) > secondCardValue) {
+                            this._debug(`三家：二家跟大牌，压制二家防四家跑分`);
+                            return [leadSuitCards[i]];
+                        }
+                    }
+                    // 压不过 → 跟最小非分牌
+                    const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+                    if (nonPoint.length > 0) return [nonPoint[0]];
+                    const discardCard = this._getDiscardScoreCard(leadSuitCards);
+                    return [discardCard || leadSuitCards[0]];
+                }
+                // 四家大概率无分牌 → 放过，跟最小非分牌
+                this._debug(`三家：二家跟大牌但四家无分牌，放过`);
+                const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+                if (nonPoint.length > 0) return [nonPoint[0]];
+                const discardCard = this._getDiscardScoreCard(leadSuitCards);
+                return [discardCard || leadSuitCards[0]];
+            }
+
+            // 二家毙杀了（对手在赢）→ 跟随非分小牌
+            // AI文档："若二家已经毙杀，自己未断门，跟随非分小牌"
+            const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+            if (nonPoint.length > 0) return [nonPoint[0]];
+            const discardCard = this._getDiscardScoreCard(leadSuitCards);
+            return [discardCard || leadSuitCards[0]];
+        }
+
+        // ================================================================
+        // 通用策略（position 2/4 或首家非队友）
+        // ================================================================
         if (iAmWinning) {
-            // 判断队友出的是不是大牌（A或K）
-            const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
-            const winnerCard = winner.cards[0];
-            const winnerValue = getCardValue(winnerCard, trumpSuit, level);
-            const teammatePlayedBig = winnerValue >= 11; // A=11, K=10在副牌RANKS中
+            const teammatePlayedBig = winnerValue >= 11; // A=11
 
             if (isLastPlayer) {
-                // 最后一家，队友赢，贴分牌
-                const pointCards = leadSuitCards.filter(c => this._isPointCard(c));
-                if (pointCards.length > 0) {
-                    return [pointCards[pointCards.length - 1]]; // 最大的分牌
-                }
-                // 没有分牌，跟最小的
+                const runCard = this._getRunScoreCard(leadSuitCards);
+                if (runCard) return [runCard];
                 return [leadSuitCards[0]];
             }
 
-            // 非最后一家，队友赢
             if (teammatePlayedBig) {
-                // 队友出大牌（如A），贴分牌跑分（10或K）
-                const pointCards = leadSuitCards.filter(c => this._isPointCard(c));
-                if (pointCards.length > 0) {
-                    // 贴最大的分牌
-                    return [pointCards[pointCards.length - 1]];
-                }
-                // 没有分牌，跟最小的
+                const runCard = this._getRunScoreCard(leadSuitCards);
+                if (runCard) return [runCard];
                 return [leadSuitCards[0]];
             }
 
-            // 队友出小牌赢，非最后一家
-            // === 中盘拦截策略 ===
-            // 庄家走小牌，下家小跟，无分。队友AI要用J/Q等中级牌拦截，
-            // 防止最后一家出10得分的可能性。不用A（中盘AK大概率走完了），
-            // 不用K（如果有K是最后一家的那是他的分，拦不住）。
+            // 队友出小牌赢，非最后一家 → 拦截
             if (this._shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, leadSuit)) {
                 const interceptCard = this._findInterceptCard(leadSuitCards, trumpSuit, level);
                 if (interceptCard) return [interceptCard];
             }
 
-            // 队友出小牌，跟最小的非分牌（保留分牌给队友大牌时贴）
             const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
-            if (nonPoint.length > 0) return [nonPoint[0]];
-            // 全是分牌，跟最小的
-            return [leadSuitCards[0]];
+            if (nonPoint.length > 0) return [this._pickRandom(nonPoint.slice(0, Math.min(2, nonPoint.length)))];
+            const discardCard = this._getDiscardScoreCard(leadSuitCards);
+            return [discardCard || leadSuitCards[0]];
         }
 
         // 对手赢
-        // 先看能不能赢（同花色内比大小）
-        const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
-        const winnerCard = winner.cards[0];
         const winnerIsTrump = isTrump(winnerCard, trumpSuit, level);
-
         if (!winnerIsTrump) {
-            // 当前赢家是副牌，看能不能用更大的同花色副牌赢
-            const winnerValue = getCardValue(winnerCard, trumpSuit, level);
+            const winnerValue2 = getCardValue(winnerCard, trumpSuit, level);
             for (let i = leadSuitCards.length - 1; i >= 0; i--) {
-                if (getCardValue(leadSuitCards[i], trumpSuit, level) > winnerValue) {
-                    // 能赢，出最小的能赢的牌
+                if (getCardValue(leadSuitCards[i], trumpSuit, level) > winnerValue2) {
                     return [leadSuitCards[i]];
                 }
             }
         }
-        // 赢不了（对手杀主了或牌不够大）
-        // 预判队友杀牌 → 主动加分（队友若断门会用主牌杀，我的分牌会被一并收走）
         if (this._teammateLikelyToKill(leadSuit, trickCards, trumpSuit, level)) {
-            const pointCards = leadSuitCards.filter(c => this._isPointCard(c));
-            if (pointCards.length > 0) {
-                return [pointCards[pointCards.length - 1]]; // 最大的分牌
-            }
+            const runCard = this._getRunScoreCard(leadSuitCards);
+            if (runCard) return [runCard];
         }
-        // 跟最小非分牌
         const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
         if (nonPoint.length > 0) return [nonPoint[0]];
-        return [leadSuitCards[0]];
+        const discardCard = this._getDiscardScoreCard(leadSuitCards);
+        return [discardCard || leadSuitCards[0]];
     }
 
     /**
@@ -2010,8 +2774,93 @@ class TractorAI {
      *   需要出牌权 → 出最大的对子杀队友（上手）
      *   不需要出牌权 → 出最小非分牌对子；最后一家贴分牌对子
      */
-    _followPair(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand) {
+    _followPair(leadSuitCards, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit, hand, position, leadPlayer) {
         const pairs = this._findPairs(leadSuitCards, trumpSuit, level);
+
+        // ================================================================
+        // 三家（position=3），对门（队友）是首家——专属策略
+        // ================================================================
+        if (position === 3 && this._isTeammate(leadPlayer) && !isLastPlayer && pairs.length > 0) {
+            const pointPairs = pairs.filter(p => p.some(c => this._isPointCard(c)));
+            const nonPointPairs = pairs.filter(p => !p.some(c => this._isPointCard(c)));
+
+            const leadCard = trickCards[0].cards[0];
+            const leadValue = getCardValue(leadCard, trumpSuit, level);
+            const teammatePlayedBig = leadValue >= 11; // A对
+
+            // 判断二家是否毙杀
+            const secondPlayerCards = trickCards.length >= 2 ? trickCards[1].cards : [];
+            const secondKilled = secondPlayerCards.length > 0 &&
+                secondPlayerCards.some(c => isTrump(c, trumpSuit, level));
+            const secondCardValue = secondPlayerCards.length > 0
+                ? getCardValue(secondPlayerCards[0], trumpSuit, level) : 0;
+
+            // --- 队友首发大对子 ---
+            if (teammatePlayedBig) {
+                if (!secondKilled) {
+                    // 二家未毙杀 → 队友大对在赢
+                    // 综合走牌历史判断队友这对子最终能否赢（含四家断门杀主的风险），再决定是否跑分
+                    // 队友走绝对大牌时，三家也要考虑四家断门反杀的可能，而非机械跑分
+                    const bigLikelyWin = this._teammatePairLikelyWin(
+                        trickCards, trumpSuit, level, hand, leadSuit, leadPlayer, isLastPlayer);
+                    if (bigLikelyWin) {
+                        if (pointPairs.length > 0) {
+                            const runPriority = { '10': 3, 'K': 2, '5': 1 };
+                            const sorted = [...pointPairs].sort((a, b) =>
+                                (runPriority[b[0].rank] || 0) - (runPriority[a[0].rank] || 0));
+                            this._debug(`三家：队友大对大概率赢，跑分对${sorted[0][0].rank}`);
+                            return sorted[0];
+                        }
+                        // 无分牌对子 → 出最大非分牌对子（帮队友消耗）
+                        if (nonPointPairs.length > 0) return nonPointPairs[nonPointPairs.length - 1];
+                        return pairs[pairs.length - 1];
+                    }
+                    // 队友未必能赢（如四家断门可能杀主反超）→ 保守跟最小非分牌对子
+                    this._debug(`三家：队友大对但有被反超风险，保守跟小对`);
+                    if (nonPointPairs.length > 0) return nonPointPairs[0];
+                    return pairs[0];
+                }
+                // 二家已毙杀 → 跟最小非分牌对子
+                if (nonPointPairs.length > 0) return nonPointPairs[0];
+                return pairs[0];
+            }
+
+            // --- 队友首发小对子 ---
+            if (!secondKilled) {
+                // 二家跟了对子（未毙杀）
+                // 拦截：用能赢的最小对子压制，防四家跑分对
+                const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+                const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+                for (const pair of nonPointPairs) {
+                    if (getCardValue(pair[0], trumpSuit, level) > winnerValue) {
+                        this._debug(`三家：队友小对，拦截防四家跑分`);
+                        return pair;
+                    }
+                }
+                // 非分牌对子赢不了 → 看分牌对子能否赢（关键时刻也用）
+                const fourthHasScore = this._opponentLikelyHasScore(
+                    trickCards, trumpSuit, level, hand, leadPlayer);
+                if (fourthHasScore) {
+                    for (const pair of pointPairs) {
+                        if (getCardValue(pair[0], trumpSuit, level) > winnerValue) {
+                            this._debug(`三家：队友小对，用分牌对拦截`);
+                            return pair;
+                        }
+                    }
+                }
+                // 赢不了 → 跟最小非分牌对子
+                if (nonPointPairs.length > 0) return nonPointPairs[0];
+                return pairs[0];
+            }
+
+            // 二家毙杀了 → 跟最小非分牌对子
+            if (nonPointPairs.length > 0) return nonPointPairs[0];
+            return pairs[0];
+        }
+
+        // ================================================================
+        // 通用策略（position 2/4 或首家非队友）
+        // ================================================================
 
         if (pairs.length > 0) {
             // 分离分牌对子和非分牌对子
@@ -2021,9 +2870,13 @@ class TractorAI {
             if (iAmWinning) {
                 // === 队友在赢 ===
                 if (isLastPlayer) {
-                    // 最后一家，队友赢，贴最大的分牌对子
+                    // 最后一家，队友赢，贴分牌对子跑分
+                    // AI文档："优先跑10（分值高），其次跑K，最次跑5"
                     if (pointPairs.length > 0) {
-                        return pointPairs[pointPairs.length - 1];
+                        const runPriority = { '10': 3, 'K': 2, '5': 1 };
+                        const sorted = [...pointPairs].sort((a, b) =>
+                            (runPriority[b[0].rank] || 0) - (runPriority[a[0].rank] || 0));
+                        return sorted[0];
                     }
                     // 没有分牌对子，出最大的非分牌对子（帮队友消耗）
                     if (nonPointPairs.length > 0) {
@@ -2045,7 +2898,18 @@ class TractorAI {
                     // 只有分牌对子，不出分牌去抢牌权（不划算）
                 }
 
-                // 不需要出牌权 → 出最小的非分牌对子（保留分牌对子）
+                // 不需要出牌权 → 根据走牌历史判断队友这对子最终能否赢下来，决定是否出分牌对子配合跑分
+                const pairLikelyWin = this._teammatePairLikelyWin(
+                    trickCards, trumpSuit, level, hand, leadSuit, leadPlayer, isLastPlayer);
+                if (pairLikelyWin && pointPairs.length > 0) {
+                    // 队友大概率能赢 → 出分牌对子配合跑分（优先10>K>5），而非机械保留分牌对子
+                    const runPriority = { '10': 3, 'K': 2, '5': 1 };
+                    const sorted = [...pointPairs].sort((a, b) =>
+                        (runPriority[b[0].rank] || 0) - (runPriority[a[0].rank] || 0));
+                    this._debug(`跟对子：队友大概率赢，配合跑分对${sorted[0][0].rank}`);
+                    return sorted[0];
+                }
+                // 队友未必能赢或无分牌对子 → 出最小非分牌对子（保留分牌对子）
                 if (nonPointPairs.length > 0) return nonPointPairs[0];
                 // 只有分牌对子，出最小的
                 return pairs[0];
@@ -2081,48 +2945,96 @@ class TractorAI {
             return pairs[0];
         }
 
-        // 没有对子，出两张牌
+        // 没有对子，出两张散牌跟对子（合法但赢不了）
         if (iAmWinning) {
             if (isLastPlayer) {
-                // 最后一家，队友赢，贴分牌
-                const pointCards = leadSuitCards.filter(c => this._isPointCard(c));
-                const nonPointCards = leadSuitCards.filter(c => !this._isPointCard(c));
+                // 最后一家，队友赢，贴分牌跑分
+                // AI文档："优先跑10（分值高），其次跑K，最次跑5"
                 const result = [];
-                // 先贴最大的分牌
-                while (result.length < 2 && pointCards.length > 0) {
-                    result.push(pointCards.pop());
-                }
-                // 不够用非分牌补
-                while (result.length < 2 && nonPointCards.length > 0) {
-                    result.push(nonPointCards.shift());
+                const remaining = [...leadSuitCards];
+                // 依次取最优跑分牌（10>K>5）
+                for (let i = 0; i < 2 && remaining.length > 0; i++) {
+                    const runCard = this._getRunScoreCard(remaining);
+                    if (runCard) {
+                        result.push(runCard);
+                        remaining.splice(remaining.indexOf(runCard), 1);
+                    } else {
+                        // 没分牌了，出最小的非分牌
+                        const nonPoint = remaining.filter(c => !this._isPointCard(c));
+                        if (nonPoint.length > 0) {
+                            result.push(nonPoint[0]);
+                            remaining.splice(remaining.indexOf(nonPoint[0]), 1);
+                        } else {
+                            result.push(remaining[0]);
+                            remaining.shift();
+                        }
+                    }
                 }
                 return result;
             }
             // 非最后一家，队友赢，出最小的两张非分牌
             const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
             if (nonPoint.length >= 2) return [nonPoint[0], nonPoint[1]];
-            // 只有1张非分牌，出非分牌+最小的其他牌
+            // 只有1张非分牌，出非分牌+被迫垫分牌（优先5>10>K，先出分值低的）
             if (nonPoint.length === 1) {
-                const other = leadSuitCards.find(c => c.id !== nonPoint[0].id);
-                return [nonPoint[0], other || nonPoint[0]];
+                const remaining = leadSuitCards.filter(c => c.id !== nonPoint[0].id);
+                const discardCard = this._getDiscardScoreCard(remaining);
+                return [nonPoint[0], discardCard || remaining[0]];
             }
-            // 全是分牌，出最小的两张
-            if (leadSuitCards.length >= 2) return [leadSuitCards[0], leadSuitCards[1]];
-            return [leadSuitCards[0]];
+            // 全是分牌，被迫垫分牌（优先5>10>K，先出分值低的）
+            const allPointResult = [];
+            const remaining = [...leadSuitCards];
+            for (let i = 0; i < 2 && remaining.length > 0; i++) {
+                const discardCard = this._getDiscardScoreCard(remaining);
+                if (discardCard) {
+                    allPointResult.push(discardCard);
+                    remaining.splice(remaining.indexOf(discardCard), 1);
+                } else {
+                    allPointResult.push(remaining[0]);
+                    remaining.shift();
+                }
+            }
+            return allPointResult;
         }
 
-        // 对手赢，出最大的两张（试图赢）
-        const len = leadSuitCards.length;
-        if (len >= 2) {
-            return [leadSuitCards[len - 1], leadSuitCards[len - 2]];
+        // 对手赢，散牌跟对子赢不了，尽量少送分
+        // 先看能不能赢（同花色内比大小）
+        const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+        const winnerCard = winner.cards[0];
+        const winnerIsTrump = isTrump(winnerCard, trumpSuit, level);
+
+        if (!winnerIsTrump) {
+            // 当前赢家是副牌对子，散牌不可能赢对子
+            // 被迫垫牌：优先非分牌，再垫分牌（5>10>K，先出分值低的）
+            const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
+            if (nonPoint.length >= 2) return [nonPoint[0], nonPoint[1]];
+            if (nonPoint.length === 1) {
+                const remaining = leadSuitCards.filter(c => c.id !== nonPoint[0].id);
+                const discardCard = this._getDiscardScoreCard(remaining);
+                return [nonPoint[0], discardCard || remaining[0]];
+            }
         }
-        return [leadSuitCards[0]];
+
+        // 对手杀主了或全是分牌 → 被迫垫分牌（优先5>10>K）
+        const discardResult = [];
+        const remaining = [...leadSuitCards];
+        for (let i = 0; i < 2 && remaining.length > 0; i++) {
+            const discardCard = this._getDiscardScoreCard(remaining);
+            if (discardCard) {
+                discardResult.push(discardCard);
+                remaining.splice(remaining.indexOf(discardCard), 1);
+            } else {
+                discardResult.push(remaining[0]);
+                remaining.shift();
+            }
+        }
+        return discardResult.length > 0 ? discardResult : [leadSuitCards[0]];
     }
 
     /**
      * 跟拖拉机副牌
      * 跟牌优先级：拖拉机 → 2对子 → 1对子+单牌 → 4单牌
-     * 队友赢时贴分跑分；对手赢时出大牌试图赢
+     * 队友赢时贴分跑分；对手拖拉机赢时出小牌跟随，保留实力和分数（拖拉机99%赢不了，避其锋芒）
      */
     _followTractor(leadSuitCards, needLen, iAmWinning, trickScore, trumpSuit, level, trickCards, isLastPlayer, leadSuit) {
         const tractors = this._findTractors(leadSuitCards, trumpSuit, level);
@@ -2143,7 +3055,19 @@ class TractorAI {
                 }
                 return matching.slice(0, needLen);
             }
-            // 对手赢，出最大拖拉机试图赢
+            // 对手拖拉机赢。拖拉机只有"真的能赢"和"完全不能赢"两种，99%不能赢。
+            // 能赢：出最小能赢的拖拉机；不能赢：出最小拖拉机跟随，避其锋芒、保留实力与分数。
+            const tractorWinner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+            const tractorWinVal = getCardValue(tractorWinner.cards[0], trumpSuit, level);
+            const winTractor = tractors
+                .filter(t => t.length >= needLen &&
+                    getCardValue(t[0], trumpSuit, level) > tractorWinVal)
+                .sort((a, b) => getCardValue(a[0], trumpSuit, level) - getCardValue(b[0], trumpSuit, level))[0];
+            if (winTractor) {
+                this._debug(`跟拖拉机：有更大拖拉机，出最小能赢拖拉机`);
+                return winTractor.slice(0, needLen);
+            }
+            this._debug(`跟拖拉机：对手拖拉机赢，赢不了，出最小拖拉机跟随`);
             return matching.slice(0, needLen);
         }
 
@@ -2174,9 +3098,14 @@ class TractorAI {
                     }
                 }
             } else {
-                // 对手赢，出最大的对子
-                for (let i = 0; i < Math.min(neededPairs, pairs.length); i++) {
-                    result.push(...pairs[pairs.length - 1 - i]);
+                // 对手拖拉机赢，99%赢不了，出最小对子跟随，保留实力和分数
+                // 优先出非分牌对子（保留分牌），从最小的开始
+                const opNonPointPairs = pairs.filter(p => !p.some(c => this._isPointCard(c)));
+                const opPointPairs = pairs.filter(p => p.some(c => this._isPointCard(c)));
+                const opSource = opNonPointPairs.length >= neededPairs
+                    ? opNonPointPairs : [...opNonPointPairs, ...opPointPairs];
+                for (let i = 0; i < Math.min(neededPairs, opSource.length); i++) {
+                    result.push(...opSource[i]);
                 }
             }
             // 不够用单牌补
@@ -2194,7 +3123,14 @@ class TractorAI {
                 } else if (iAmWinning) {
                     result.push(unused.shift());
                 } else {
-                    result.push(unused.pop());
+                    // 对手拖拉机赢，99%赢不了，出最小非分牌跟随，保留分牌
+                    const opNonPoint = unused.find(c => !this._isPointCard(c));
+                    if (opNonPoint) {
+                        result.push(opNonPoint);
+                        unused.splice(unused.indexOf(opNonPoint), 1);
+                    } else {
+                        result.push(unused.shift());
+                    }
                 }
             }
             return result.slice(0, needLen);
@@ -2218,7 +3154,14 @@ class TractorAI {
                 } else if (iAmWinning) {
                     result.push(unused.shift());
                 } else {
-                    result.push(unused.pop());
+                    // 对手拖拉机赢，99%赢不了，出最小非分牌跟随，保留分牌
+                    const opNonPoint = unused.find(c => !this._isPointCard(c));
+                    if (opNonPoint) {
+                        result.push(opNonPoint);
+                        unused.splice(unused.indexOf(opNonPoint), 1);
+                    } else {
+                        result.push(unused.shift());
+                    }
                 }
             }
             return result.slice(0, needLen);
@@ -2249,8 +3192,15 @@ class TractorAI {
             }
             return result.slice(0, needLen);
         }
-        // 对手赢，出最大的牌
-        return leadSuitCards.slice(-needLen);
+        // 对手拖拉机赢，99%赢不了，出最小非分牌跟随，保留实力和分数
+        const opNonPointAll = leadSuitCards.filter(c => !this._isPointCard(c));
+        const opPointAll = leadSuitCards.filter(c => this._isPointCard(c));
+        if (opNonPointAll.length >= needLen) return opNonPointAll.slice(0, needLen);
+        const opResult = [...opNonPointAll];
+        while (opResult.length < needLen && opPointAll.length > 0) {
+            opResult.push(opPointAll.shift());
+        }
+        return opResult.slice(0, needLen);
     }
 
     /**
@@ -2267,19 +3217,110 @@ class TractorAI {
      * - 优先用主牌分牌（主花色的5/10/K）杀，既赢牌又拿分
      * - 没有主牌分牌时，用最小的能赢的主牌
      */
-    _followNoSuit(trumps, hand, leadPattern, trickCards, iAmWinning, trickScore, trumpSuit, level, isDealerTeam, isLastPlayer, leadSuit) {
+    _followNoSuit(trumps, hand, leadPattern, trickCards, iAmWinning, trickScore, trumpSuit, level, isDealerTeam, isLastPlayer, leadSuit, position, leadPlayer) {
         const nonTrumps = this._sortByValue(
             hand.filter(c => !isTrump(c, trumpSuit, level)), trumpSuit, level
         );
         const needLen = leadPattern.length;
 
+        // ================================================================
+        // 三家（position=3），对门（队友）是首家——断门专属策略
+        // AI文档："断门，可垫其他副牌10分或5分；也可毙杀主牌分，接过出牌权"
+        //         "若二家毙杀，自己也断门，用更大主牌毙杀，压过二家"
+        // ================================================================
+        if (position === 3 && this._isTeammate(leadPlayer) && !isLastPlayer) {
+            const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+            const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+            const winnerIsTeammate = this._isTeammate(winner.player);
+
+            // 判断二家是否毙杀
+            const secondPlayerCards = trickCards.length >= 2 ? trickCards[1].cards : [];
+            const secondKilled = secondPlayerCards.length > 0 &&
+                secondPlayerCards.some(c => isTrump(c, trumpSuit, level));
+
+            if (winnerIsTeammate && !secondKilled) {
+                // 队友在赢，二家没杀 → 断门跑分
+                // "可垫其他副牌10分或5分"
+                const pointCards = nonTrumps.filter(c => this._isPointCard(c));
+                const result = [];
+                const used = new Set();
+                // 先垫最大的分牌
+                for (let i = pointCards.length - 1; i >= 0 && result.length < needLen; i--) {
+                    result.push(pointCards[i]);
+                    used.add(pointCards[i].id);
+                }
+                // 不够垫最小非分牌
+                const safeCards = nonTrumps.filter(c => !this._isPointCard(c) && !used.has(c.id));
+                for (const card of safeCards) {
+                    if (result.length >= needLen) break;
+                    result.push(card);
+                    used.add(card.id);
+                }
+                // 还不够垫最小主牌
+                for (const card of trumps) {
+                    if (result.length >= needLen) break;
+                    if (!used.has(card.id)) {
+                        result.push(card);
+                        used.add(card.id);
+                    }
+                }
+                this._debug(`三家：断门，队友赢，跑分`);
+                return result.slice(0, needLen);
+            }
+
+            // 二家杀了或对手在赢 → 尝试用更大主牌毙杀
+            // "也可毙杀主牌分，接过出牌权"
+            // "若二家毙杀，自己也断门，用更大主牌毙杀，压过二家"
+            if (trumps.length >= needLen) {
+                const killCards = this._killWithTrump(trumps, leadPattern, trickCards, trumpSuit, level, needLen);
+                if (killCards) {
+                    // 验证杀的牌比当前赢家大
+                    const killValue = getCardValue(killCards[0], trumpSuit, level);
+                    if (killValue > winnerValue || leadPattern.type !== 'single') {
+                        this._debug(`三家：断门，毙杀压过二家`);
+                        return killCards;
+                    }
+                }
+            }
+
+            // 杀不了 → 垫牌（优先跑分）
+            const pointCards = nonTrumps.filter(c => this._isPointCard(c));
+            const result = [];
+            const used = new Set();
+            for (let i = pointCards.length - 1; i >= 0 && result.length < needLen; i--) {
+                result.push(pointCards[i]);
+                used.add(pointCards[i].id);
+            }
+            const safeCards = nonTrumps.filter(c => !this._isPointCard(c) && !used.has(c.id));
+            for (const card of safeCards) {
+                if (result.length >= needLen) break;
+                result.push(card);
+                used.add(card.id);
+            }
+            for (const card of trumps) {
+                if (result.length >= needLen) break;
+                if (!used.has(card.id)) {
+                    result.push(card);
+                    used.add(card.id);
+                }
+            }
+            return result.slice(0, needLen);
+        }
+
         // === 预判队友杀牌 → 主动加分 ===
         // "预判队友可能有较高机会杀牌而主动加分"
         // 条件：队友还没出牌 + 队友很可能断了该花色（记忆有记录）
         // 此时队友大概率会用主牌杀，我垫的分会被队友一并收走
+        //
+        // 【限制】不能盲目垫分：除非是第二家（首家是对手出的副牌，第四家队友明确断门可以毙杀），
+        // 才可以垫分等第四家杀。其余位置（三家/四家）即便预判队友可能杀，也不主动垫分，
+        // 避免垫出的分牌被对手收走。
         const teammateMightKill = this._teammateLikelyToKill(leadSuit, trickCards, trumpSuit, level);
-        if (teammateMightKill) {
-            // 队友会杀：疯狂垫分牌！断门后找出所有大分牌
+        // 仅当处于第二家、且首家是对手时，第四家才是队友，才可放心垫分等其毙杀
+        const safeToWaitForFourthKill =
+            (position === 2) && leadPlayer && !this._isTeammate(leadPlayer);
+        if (teammateMightKill && safeToWaitForFourthKill) {
+            // 队友会杀：垫分牌等第四家杀！断门后找出所有大分牌
             // 但保留主牌的分数对子或拖拉机（太值钱，留给队友大牌时贴）
             const pointCards = nonTrumps.filter(c => this._isPointCard(c));
             const result = [];
@@ -2403,19 +3444,28 @@ class TractorAI {
      * 甩牌跟牌规则：
      *   - 必须跟数量相同的牌
      *   - 有同花色的必须跟（有多少跟多少），不够的可以垫任何牌
-     *   - 要杀的话，必须断门，出数量一样多的全主牌，且对子数≥甩牌中的对子数
+     *   - 要杀的话，必须断门，出数量一样多的全主牌，
+     *     且拖拉机数≥甩牌拖拉机数、对子数≥甩牌对子数
      *
-     * AI策略：
+     * AI策略（tractor_AI文档）：
      *   1. 有花色时：
-     *      - 队友甩牌（对方杀不动）→ 疯狂垫分数！选最大的分牌
-     *      - 对手甩牌（我方无杀希望）→ 垫非分数小牌，或垫分数牌断门，实在不行垫主牌
+     *      - 队友甩牌（对方大概率杀不动）→ 疯狂垫分牌跑分！选最大的分牌
+     *        AI文档："队友首发甩牌，二家没杀的话，垫副牌分数，能断门的花色优先垫"
+     *      - 对手甩牌 → 本门未断门但都是小牌就跟小牌，数量不够就尽量找能断门的
+     *        其他副牌来垫；已断门的更是找能断门的其他副牌来垫
      *   2. 断门时：
-     *      - 能杀且对手在赢 → 用全主牌杀（优先主牌分牌）
+     *      - 能杀且对手在赢 → 判断要不要不惜代价杀
+     *        AI文档："甩牌通常是多张，断门的情况下可以加很多分来跑"
+     *        "如果三家加了很多分（比如20+），能毙杀自然要毙杀；分不多的话，
+     *         不毙杀也可以养精蓄锐徐徐图之，正好垫牌断门其他副牌"
      *      - 不能杀或队友在赢 → 按上述垫牌策略
      */
     _followThrow(hand, leadPattern, leadSuit, trickCards, iAmWinning, trickScore, trumpSuit, level, isLastPlayer, trumps) {
         const needLen = leadPattern.length;
-        const leadPairs = countPairsInCards(trickCards[0].cards, trumpSuit, level);
+        // 使用analyzeCardStructure获取甩牌的拖拉机数和对子数（修正后毙杀条件需匹配）
+        const leadStruct = analyzeCardStructure(trickCards[0].cards, trumpSuit, level);
+        const leadTractorCount = leadStruct.tractors.length;
+        const leadPairCount = leadStruct.pairs.length;
 
         // 该花色的副牌
         const leadSuitCards = leadSuit ? this._sortByValue(
@@ -2431,16 +3481,23 @@ class TractorAI {
         }
 
         // === 断门：可以杀或垫牌 ===
-        // 检查能否杀甩牌：全主牌 + 张数相同 + 对子数≥甩牌对子数
+        // 修正：检查拖拉机数和对子数是否足够杀甩牌
         const canKill = trumps.length >= needLen;
-        const trumpPairs = canKill ? this._findPairs(trumps, trumpSuit, level) : [];
-        const hasEnoughPairs = trumpPairs.length >= leadPairs;
+        const trumpStruct = canKill ? analyzeCardStructure(trumps, trumpSuit, level) : { tractors: [], pairs: [] };
+        const hasEnoughStructure = trumpStruct.tractors.length >= leadTractorCount &&
+                                    trumpStruct.pairs.length >= leadPairCount;
 
-        if (canKill && hasEnoughPairs && !iAmWinning) {
+        if (canKill && hasEnoughStructure && !iAmWinning) {
             // 对手在赢，尝试杀
-            const killResult = this._killThrow(trumps, leadPairs, needLen, trumpSuit, level, trickCards);
-            if (killResult) return killResult;
-            // 杀不了（已有更大的杀牌）→ 垫牌
+            // AI文档："万幸能毙杀的话，结合场上局势，判断要不要不惜代价毙杀"
+            //   - 三家加了很多分（20+）→ 必须杀
+            //   - 分不多（5-15）→ 可以不杀，养精蓄锐，垫牌断门
+            const shouldKill = trickScore >= 15 || isLastPlayer;
+            if (shouldKill) {
+                const killResult = this._killThrow(trumps, leadTractorCount, leadPairCount, needLen, trumpSuit, level, trickCards);
+                if (killResult) return killResult;
+            }
+            // 杀不了或分不多不值得杀 → 垫牌
         }
 
         // 垫牌
@@ -2639,8 +3696,12 @@ class TractorAI {
      *
      * @returns {Array|null} 杀牌数组，或null（杀不了）
      */
-    _killThrow(trumps, leadPairs, needLen, trumpSuit, level, trickCards) {
-        const pairs = this._findPairs(trumps, trumpSuit, level);
+    _killThrow(trumps, leadTractorCount, leadPairCount, needLen, trumpSuit, level, trickCards) {
+        // 修正：使用analyzeCardStructure进行拖拉机+对子匹配
+        const struct = analyzeCardStructure(trumps, trumpSuit, level);
+        const tractors = struct.tractors;
+        const pairs = struct.pairs;
+        const singles = struct.singles;
 
         // 检查是否已有杀牌（当前赢家不是甩牌者）
         const currentWinner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
@@ -2648,28 +3709,41 @@ class TractorAI {
         const needBeatValue = winnerIsThrower ? -1 :
             Math.max(...currentWinner.cards.map(c => getCardValue(c, trumpSuit, level)));
 
-        // 按大小降序排列对子
-        const sortedPairs = [...pairs].sort((a, b) =>
-            getCardValue(b[0], trumpSuit, level) - getCardValue(a[0], trumpSuit, level)
-        );
-
         const result = [];
         const used = new Set();
 
-        // 先用足够数量的对子（优先大的，确保能超越已有杀牌）
-        const pairsNeeded = leadPairs;
+        // 1. 先用拖拉机匹配甩牌中的拖拉机（优先大的拖拉机）
+        const sortedTractors = [...tractors].sort((a, b) => {
+            const maxA = Math.max(...a.map(c => getCardValue(c, trumpSuit, level)));
+            const maxB = Math.max(...b.map(c => getCardValue(c, trumpSuit, level)));
+            return maxB - maxA;
+        });
+        let tractorsUsed = 0;
+        for (const tractor of sortedTractors) {
+            if (tractorsUsed >= leadTractorCount) break;
+            if (result.length + tractor.length > needLen) break;
+            result.push(...tractor);
+            tractor.forEach(c => used.add(c.id));
+            tractorsUsed++;
+        }
+
+        // 2. 用对子匹配甩牌中的对子（优先大的对子）
+        const sortedPairs = [...pairs].sort((a, b) =>
+            getCardValue(b[0], trumpSuit, level) - getCardValue(a[0], trumpSuit, level)
+        );
         let pairsUsed = 0;
         for (const pair of sortedPairs) {
-            if (pairsUsed >= pairsNeeded) break;
+            if (pairsUsed >= leadPairCount) break;
             if (result.length + 2 > needLen) break;
+            if (used.has(pair[0].id) || used.has(pair[1].id)) continue;
             result.push(...pair);
             used.add(pair[0].id);
             used.add(pair[1].id);
             pairsUsed++;
         }
 
-        // 不够，用单张主牌补足（优先分牌，再优先大的）
-        const remaining = trumps.filter(c => !used.has(c.id));
+        // 3. 用单张主牌补足（优先分牌，再优先大的）
+        const remaining = singles.filter(c => !used.has(c.id));
         const pointSingles = remaining.filter(c => this._isPointCard(c))
             .sort((a, b) => getCardValue(b, trumpSuit, level) - getCardValue(a, trumpSuit, level));
         const nonPointSingles = remaining.filter(c => !this._isPointCard(c))
@@ -2686,13 +3760,15 @@ class TractorAI {
             used.add(card.id);
         }
 
-        // 验证：对子数是否足够
-        const resultPairs = countPairsInCards(result, trumpSuit, level);
-        if (resultPairs < leadPairs) return null;
+        // 验证：拖拉机数和对子数是否足够
+        const resultStruct = analyzeCardStructure(result, trumpSuit, level);
+        if (resultStruct.tractors.length < leadTractorCount ||
+            resultStruct.pairs.length < leadPairCount) return null;
 
-        // 验证：最大主牌是否能超越已有杀牌
-        const resultMaxValue = Math.max(...result.map(c => getCardValue(c, trumpSuit, level)));
-        if (resultMaxValue <= needBeatValue) return null;
+        // 验证：毙杀强度是否能超越已有杀牌
+        if (!winnerIsThrower) {
+            if (compareKillStrength(result, currentWinner.cards, trumpSuit, level) <= 0) return null;
+        }
 
         return result.slice(0, needLen);
     }
@@ -2865,40 +3941,58 @@ class TractorAI {
 
     /**
      * 判断是否想要拿到出牌权
-     * 条件：手上有强力牌可以出（如副牌A、大对子、拖拉机）
-     * 或者手上有分牌需要队友帮忙跑分
+     *
+     * 【强势牌计分制】
+     * 手上有副牌A、JQK大对子、拖拉机等强势牌时，每一张牌算1分；
+     * 只要强势牌总分 ≥ 2 分，即值得抢到出牌权。
+     *
+     * 抢到出牌权后的出牌原则（由 _leadWithStrength 等首家策略落地）：
+     *   - 优先走绝对大牌（副牌A 等）；
+     *   - JQK 对子要分情况看是否"绝对大牌"（结合已出大牌记忆判断，
+     *     若该花色更大的对子已出完则当前JQK对子即为绝对大牌，否则谨慎）。
+     *
+     * 注意：仅统计"非当前出牌花色"的强势牌（当前花色因断门无法直接走）。
+     *
+     * @returns {boolean}
      */
     _wantControl(hand, trumpSuit, level, currentLeadSuit) {
         if (!hand) return false;
 
-        // 如果还有副牌A（非当前出牌花色），想要出牌权出A
-        for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
-            if (suit === currentLeadSuit) continue;
-            const aCard = hand.find(c =>
-                c.suit === suit && c.rank === 'A' && !isTrump(c, trumpSuit, level)
-            );
-            if (aCard) return true;
-        }
-
-        // 如果还有大对子（A对、K对），想要出牌权
         const nonTrumps = hand.filter(c => !isTrump(c, trumpSuit, level));
         const suitGroups = {};
         for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
             suitGroups[suit] = nonTrumps.filter(c => c.suit === suit);
         }
+
+        let strengthScore = 0;
+
         for (const suit of Object.keys(suitGroups)) {
             if (suit === currentLeadSuit) continue;
-            const pairs = this._findPairs(suitGroups[suit], trumpSuit, level);
+            const cards = suitGroups[suit];
+
+            // 副牌A：每张A算1分
+            const aces = cards.filter(c => c.rank === 'A');
+            strengthScore += aces.length;
+
+            // JQK大对子：对子里每张牌算1分（即一个对子=2分）
+            // 仅用于判断"是否值得抢权"；抢到出牌权后是否走该对子，
+            // 由首家策略根据"是否绝对大牌"分情况判断。
+            const pairs = this._findPairs(cards, trumpSuit, level);
             for (const pair of pairs) {
-                if (['A', 'K'].includes(pair[0].rank)) return true;
+                if (['J', 'Q', 'K'].includes(pair[0].rank)) {
+                    strengthScore += pair.length; // 每张牌1分
+                }
+            }
+
+            // 拖拉机：每张牌算1分
+            const tractors = this._findTractors(cards, trumpSuit, level);
+            for (const tractor of tractors) {
+                strengthScore += tractor.length;
             }
         }
 
-        // 如果手上有分牌且队友可能能帮忙跑分
-        const pointCards = hand.filter(c => this._isPointCard(c) && !isTrump(c, trumpSuit, level));
-        if (pointCards.length >= 3) return true;
-
-        return false;
+        // 只要强势牌总分≥2分，即值得抢到出牌权
+        return strengthScore >= 2;
     }
 
     /**
@@ -3023,6 +4117,349 @@ class TractorAI {
         }
         return tractors;
     }
+
+    // ================================================================
+    //  AI增强工具函数（基于tractor_AI文档策略）
+    // ================================================================
+
+    /**
+     * 跑分时选择最优分牌：优先10（分值高），其次K（分值高但可留做绝对大牌），最后5（分值较低）
+     * AI文档："优先跑10（分值高），其次跑K（分值高，本可留着走完A成为绝对大牌），最次跑5（分值较低）"
+     */
+    _getRunScoreCard(cards) {
+        const pointCards = cards.filter(c => this._isPointCard(c));
+        if (pointCards.length === 0) return null;
+        // 优先级：10 > K > 5
+        const priority = { '10': 3, 'K': 2, '5': 1 };
+        pointCards.sort((a, b) => (priority[b.rank] || 0) - (priority[a.rank] || 0));
+        return pointCards[0];
+    }
+
+    /**
+     * 被迫垫分牌时选择最优分牌：优先5（分值最低），其次10，最后K（分值最高，尽量保留）
+     * AI文档："先跟5，再跟10,最后选择是跟K"
+     */
+    _getDiscardScoreCard(cards) {
+        const pointCards = cards.filter(c => this._isPointCard(c));
+        if (pointCards.length === 0) return null;
+        // 优先级：5 > 10 > K（先出分值低的）
+        const priority = { '5': 3, '10': 2, 'K': 1 };
+        pointCards.sort((a, b) => (priority[b.rank] || 0) - (priority[a.rank] || 0));
+        return pointCards[0];
+    }
+
+    /**
+     * 从数组中随机选择一个元素（防止行为可预测）
+     * 截图建议："多个策略评分相等时，需引入随机选择"
+     */
+    _pickRandom(arr) {
+        if (!arr || arr.length === 0) return null;
+        if (arr.length === 1) return arr[0];
+        return arr[Math.floor(Math.random() * arr.length)];
+    }
+
+    /**
+     * 获取当前出牌位置（1=首家, 2=次家, 3=三家, 4=四家）
+     * AI文档核心策略基于位置：次家灵活（队友四家可补救），三家是本方最后一手，四家决定胜负
+     */
+    _getPosition(trickCards) {
+        return trickCards.length + 1; // trickCards已出的牌数+1
+    }
+
+    /**
+     * 判断自己是否是首家（trickCards为空时）
+     */
+    _isLeader(trickCards) {
+        return trickCards.length === 0;
+    }
+
+    /**
+     * 判断当前是否接近终局（剩余5张牌以内，考虑抠底保底策略）
+     * AI文档："应该在倒数剩5张牌开始，战略性考虑抠底保底的策略"
+     */
+    _isBottomGamePhase(hand) {
+        return hand.length <= 5;
+    }
+
+    /**
+     * 判断是否应跳过保底策略
+     *
+     * 当底牌分数为0或5分时，拖拉机抠底/甩牌抠底的概率极低：
+     *   - 埋0分：无分可抠，完全不需要保底
+     *   - 埋5分：最坏情况对抠仅20分，不值得为此损失当前出牌利益
+     *
+     * 只有庄家AI知道底牌分数（通过decideBury记录）。
+     * 闲家AI或玩家埋底时bottomPoints为null，不跳过（保持原有策略）。
+     */
+    _shouldSkipBottomProtection() {
+        return this.memory.bottomPoints !== null && this.memory.bottomPoints <= 5;
+    }
+
+    /**
+     * 判断是否是最后一手牌（决定抠底倍数）
+     */
+    _isLastHand(hand, leadPattern) {
+        return hand.length === leadPattern.length;
+    }
+
+    /**
+     * 判断自己是否有能力在最后一轮赢牌（用于抠底/保底策略）
+     * 需要：大王、或小王+大王已出、或强势主牌组合
+     */
+    _canWinLastHand(hand, trumpSuit, level) {
+        if (this._hasBigJoker(hand)) return true;
+        if (this._hasSmallJoker(hand) && this._bigJokersPlayed() >= 2) return true;
+        const trumps = hand.filter(c => isTrump(c, trumpSuit, level));
+        const tractors = this._findTractors(trumps, trumpSuit, level);
+        if (tractors.length > 0) return true;
+        const pairs = this._findPairs(trumps, trumpSuit, level);
+        if (pairs.length >= 2) return true;
+        return false;
+    }
+
+    /**
+     * 评估手牌的抠底能力（用于闲家判断是否值得追求抠底）
+     * 返回：甩主牌 > 甩副牌 > 拖拉机 > 对子 > 单张
+     */
+    _evaluateDigBottomPotential(hand, trumpSuit, level) {
+        const trumps = hand.filter(c => isTrump(c, trumpSuit, level));
+        const tractors = this._findTractors(trumps, trumpSuit, level);
+        const pairs = this._findPairs(trumps, trumpSuit, level);
+        const hasBigJoker = this._hasBigJoker(hand);
+        const hasSmallJoker = this._hasSmallJoker(hand);
+
+        let score = 0;
+        // 大王是抠底的关键
+        if (hasBigJoker) score += 50;
+        if (hasSmallJoker) score += 20;
+        // 拖拉机可以高倍抠底
+        score += tractors.length * 30;
+        // 对子可以中等倍率抠底
+        score += pairs.length * 10;
+        // 主牌数量
+        score += Math.min(trumps.length, 10);
+        return score;
+    }
+
+    /**
+     * 终局最后一手牌策略：保底/抠底
+     *
+     * 最后一手牌的赢家获得底牌分数，倍数由牌型决定：
+     *   单张×2, 对子×4, 拖拉机×8, 甩牌×(张数×2)
+     *
+     * 庄家方（保底）：必须赢最后一手，不惜用大王
+     *   AI文档："用大王抠底或保底"——大王先出先大原则
+     *
+     * 闲家方（抠底）：尽量赢最后一手，且争取多张牌型提高倍数
+     *   AI文档："制造出最后一手多张牌一把出尽且保证赢下该轮的可能性"
+     *   "常见排名：甩主牌>甩副牌>拖拉机>对子"
+     */
+    _bottomPhaseLastHand(hand, trumps, leadPattern, leadSuit, trickCards, iAmWinning,
+                          trickScore, trumpSuit, level, isDealerTeam, isLastPlayer) {
+        const needLen = leadPattern.length;
+
+        // 队友在赢 → 不抢，配合跑分或保留
+        if (iAmWinning) {
+            // 队友赢最后一手 = 保底/抠底成功
+            // 如果是庄家方：队友保底成功，贴分牌跑分
+            // 如果是闲家方：队友抠底成功，贴分牌加大抠底收益
+            if (isLastPlayer) {
+                // 最后一家，队友赢，尽可能多贴分牌
+                const allCards = this._sortByValue([...hand], trumpSuit, level);
+                const result = [];
+                // 先贴分牌（优先10>K>5跑分）
+                for (let i = 0; i < needLen && allCards.length > 0; i++) {
+                    const runCard = this._getRunScoreCard(allCards);
+                    if (runCard) {
+                        result.push(runCard);
+                        allCards.splice(allCards.indexOf(runCard), 1);
+                    } else {
+                        // 没分牌了，贴最小的
+                        const nonPoint = allCards.filter(c => !this._isPointCard(c));
+                        if (nonPoint.length > 0) {
+                            result.push(nonPoint[0]);
+                            allCards.splice(allCards.indexOf(nonPoint[0]), 1);
+                        } else {
+                            result.push(allCards[0]);
+                            allCards.shift();
+                        }
+                    }
+                }
+                return result;
+            }
+            return null; // 非最后一家，交给常规策略
+        }
+
+        // 对手在赢 → 必须想办法赢回来
+        // 底牌≤5分时跳过保底杀牌：拖拉机抠底/甩牌抠底概率极低，
+        // 埋5分被对抠也就20分，不值得用大王等大牌去保底
+        if (this._shouldSkipBottomProtection()) {
+            return null; // 交给常规跟牌策略
+        }
+
+        // 有主牌且能同型杀 → 杀！
+        if (trumps.length >= needLen) {
+            // 检查能否同型杀
+            let canKill = false;
+            if (leadPattern.type === 'single') {
+                canKill = true;
+            } else if (leadPattern.type === 'pair') {
+                canKill = this._findPairs(trumps, trumpSuit, level).length > 0;
+            } else if (leadPattern.type === 'tractor') {
+                canKill = this._findTractors(trumps, trumpSuit, level).length > 0;
+            } else if (leadPattern.type === 'throw') {
+                const leadStruct = analyzeCardStructure(trickCards[0].cards, trumpSuit, level);
+                const trumpStruct = analyzeCardStructure(trumps, trumpSuit, level);
+                canKill = trumpStruct.tractors.length >= leadStruct.tractors.length &&
+                          trumpStruct.pairs.length >= leadStruct.pairs.length;
+            }
+
+            if (canKill) {
+                // 最后一手，不惜代价杀！用最大的主牌确保赢
+                const killCards = this._killWithTrump(trumps, leadPattern, trickCards, trumpSuit, level, needLen);
+                if (killCards) {
+                    this._debug(`终局最后一手：${isDealerTeam ? '保底' : '抠底'}杀牌`);
+                    return killCards;
+                }
+            }
+            // 单张时直接用最大的主牌杀
+            if (leadPattern.type === 'single' && trumps.length > 0) {
+                const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+                const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+                for (let i = trumps.length - 1; i >= 0; i--) {
+                    if (getCardValue(trumps[i], trumpSuit, level) > winnerValue) {
+                        this._debug(`终局最后一手：${isDealerTeam ? '保底' : '抠底'}用大主牌杀`);
+                        return [trumps[i]];
+                    }
+                }
+            }
+        }
+
+        // 有同花色牌 → 尝试用最大的赢
+        if (leadSuit) {
+            const leadSuitCards = this._sortByValue(
+                hand.filter(c => !c.isJoker && c.suit === leadSuit && !isTrump(c, trumpSuit, level)),
+                trumpSuit, level
+            );
+            if (leadSuitCards.length >= needLen) {
+                const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+                const winnerCard = winner.cards[0];
+                const winnerIsTrump = isTrump(winnerCard, trumpSuit, level);
+                if (!winnerIsTrump) {
+                    // 对手用副牌赢，看能不能用更大的副牌赢
+                    if (leadPattern.type === 'single') {
+                        const winnerValue = getCardValue(winnerCard, trumpSuit, level);
+                        for (let i = leadSuitCards.length - 1; i >= 0; i--) {
+                            if (getCardValue(leadSuitCards[i], trumpSuit, level) > winnerValue) {
+                                this._debug(`终局最后一手：用大牌赢保底/抠底`);
+                                return [leadSuitCards[i]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return null; // 无法赢，交给常规策略
+    }
+
+    /**
+     * 终局保底/抠底策略：倒数几手的出牌权争夺
+     *
+     * 庄家方（保底）：对手在赢时，如有主牌则杀，防止对手拿到出牌权控制最后一手
+     *   AI文档："保住底牌分数十分关键"
+     *
+     * 闲家方（抠底）：对手在赢时，评估是否值得杀
+     *   - 有大王/小王 + 手中有强势多张组合 → 值得杀，抢出牌权为抠底做准备
+     *   - 无强势组合 → 不浪费主牌，等更好的时机
+     *   AI文档："制造出最后一手多张牌一把出尽且保证赢下该轮的可能性"
+     */
+    _bottomPhaseProtect(hand, trumps, leadPattern, leadSuit, trickCards, trickScore,
+                         trumpSuit, level, isDealerTeam, isLastPlayer) {
+        const needLen = leadPattern.length;
+
+        // 庄家方：对手在赢 → 必须杀，保底优先
+        if (isDealerTeam) {
+            if (trumps.length >= needLen) {
+                // 检查能否同型杀
+                let canKill = false;
+                if (leadPattern.type === 'single') {
+                    canKill = true;
+                } else if (leadPattern.type === 'pair') {
+                    canKill = this._findPairs(trumps, trumpSuit, level).length > 0;
+                } else if (leadPattern.type === 'tractor') {
+                    canKill = this._findTractors(trumps, trumpSuit, level).length > 0;
+                }
+
+                if (canKill) {
+                    const killCards = this._killWithTrump(trumps, leadPattern, trickCards, trumpSuit, level, needLen);
+                    if (killCards) {
+                        this._debug(`终局保底：杀牌防止闲家拿权`);
+                        return killCards;
+                    }
+                }
+            }
+            return null; // 无法杀，交给常规策略
+        }
+
+        // 闲家方：评估抠底价值
+        const digPotential = this._evaluateDigBottomPotential(hand, trumpSuit, level);
+        // 有大王或较强主牌组合 → 值得抢权抠底
+        if (digPotential >= 50 && trumps.length >= needLen) {
+            let canKill = false;
+            if (leadPattern.type === 'single') {
+                canKill = true;
+            } else if (leadPattern.type === 'pair') {
+                canKill = this._findPairs(trumps, trumpSuit, level).length > 0;
+            } else if (leadPattern.type === 'tractor') {
+                canKill = this._findTractors(trumps, trumpSuit, level).length > 0;
+            }
+
+            if (canKill) {
+                const killCards = this._killWithTrump(trumps, leadPattern, trickCards, trumpSuit, level, needLen);
+                if (killCards) {
+                    this._debug(`终局抠底：抢出牌权（抠底潜力${digPotential}）`);
+                    return killCards;
+                }
+            }
+        }
+
+        return null; // 不值得抢权，交给常规策略
+    }
+
+    /**
+     * 调试日志输出
+     * 截图建议："建议增加DEBUG开关，输出AI每一步的评分和选择理由"
+     */
+    _debug(msg) {
+        if (typeof DEBUG !== 'undefined' && DEBUG) {
+            console.log(`[AI:${this.position}] ${msg}`);
+        }
+    }
+
+    /**
+     * 检查某牌型是否曾经甩错（避免AI重复甩错）
+     * 截图建议："AI应避免再次甩错，需记录该牌型不可再试"
+     */
+    _hasFailedThrow(cards, trumpSuit, level) {
+        if (!this.memory.failedThrows) return false;
+        const failKey = cards.map(c => `${c.suit}-${c.rank}`).sort().join(',');
+        return this.memory.failedThrows.some(f => f.key === failKey);
+    }
+
+    /**
+     * 判断对手是否大概率已断某门花色
+     * 基于记牌：如果该花色已出的牌加上自己手里的牌接近2副牌的总量
+     */
+    _isOpponentLikelyVoid(suit, trumpSuit, level, hand) {
+        if (isTrump({ suit, rank: 'A', isJoker: false }, trumpSuit, level)) return false;
+        const myCards = hand.filter(c => c.suit === suit && !isTrump(c, trumpSuit, level));
+        const playedCount = this._countPlayedSuit(suit, trumpSuit, level);
+        const totalCards = 26; // 2副牌×13张，减去级牌(2张×2副=4张) = 22，但保守用26
+        const remaining = totalCards - playedCount - myCards.length;
+        // 如果剩余很少且分散在3家手中，对手大概率断门
+        return remaining <= 3;
+    }
 }
 
 // 创建AI实例
@@ -3031,3 +4468,8 @@ const aiPlayers = {
     top: new TractorAI('top'),
     right: new TractorAI('right')
 };
+
+// Node.js 模块导出（浏览器环境自动忽略）
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = TractorAI;
+}

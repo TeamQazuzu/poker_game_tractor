@@ -44,11 +44,12 @@ const BID_TYPES = {
 };
 
 // 叫主等级（power越大越能反）
+// 修正：对小王和对大王都反成无主，不分等级（没有意义），都设为3
 const BID_POWER = {
     [BID_TYPES.SINGLE]: 1,
     [BID_TYPES.PAIR_LEVEL]: 2,
     [BID_TYPES.PAIR_SMALL_JOKER]: 3,
-    [BID_TYPES.PAIR_BIG_JOKER]: 4
+    [BID_TYPES.PAIR_BIG_JOKER]: 3
 };
 
 /**
@@ -394,7 +395,9 @@ function compareCards(card1, card2, trumpSuit, level, leadSuit) {
  * 甩牌规则：
  *   某门副牌中，手上的牌无论单双，都是市面上该门副牌里最大的，
  *   则可以一手打出。不要求是对子或拖拉机。
- *   例：市面上已出AAKKQJ，手上有QJ1010，可甩出。
+ *   判据：甩出的牌面里最小的那张，比它大的同门牌必须都已出过或也在甩牌中。
+ *   例：市面上已出A-A-K-K（两副的A和K全出），手上有Q-J-10-10，可甩出——
+ *   最小的是10，比10大的J/Q/K/A中，K和A已出，J和Q在甩牌中。
  *   杀甩牌条件：全主牌 + 张数相同 + 对子数≥甩牌中的对子数。
  */
 function getCardPattern(cards, trumpSuit, level, playedCardsHistory) {
@@ -475,14 +478,13 @@ function getCardPattern(cards, trumpSuit, level, playedCardsHistory) {
 /**
  * 验证甩牌合法性
  *
- * 甩牌条件：
- *   1. 所有牌必须是同一门副牌（不能是主牌，不能混合花色）
- *   2. 这些牌都是市面上该门副牌中剩余最大的牌
- *      即：比这些牌中任何一张大的同花色牌都已经出过了
+ * 修正后甩牌条件：
+ *   1. 所有牌必须是同一门花色（不能混合花色，可主牌，也可副牌）
+ *   2. 甩牌而出的任意一张牌，都是市面上该门花色中剩余最大的
+ *      ——即比其中任何一张大的同花色牌，要么已经出过，要么也在本次甩出的牌里
  *
- * 验证方法：
- *   对于出的每一张牌，检查是否存在同花色且比它大的牌还没出过（也不在自己手里）
- *   如果存在，则这些牌不是最大的，甩牌不合法
+ * 主牌甩牌：所有牌都是主牌（大小王、级牌、主花色牌），比每张大的主牌都已出过或在甩牌中
+ * 副牌甩牌：所有牌都是同一门副牌，比每张大的同花色牌都已出过或在甩牌中
  *
  * @param {Array} cards - 要甩的牌
  * @param {string|null} trumpSuit - 主花色
@@ -494,7 +496,70 @@ function isThrowValid(cards, trumpSuit, level, playedCardsHistory) {
     if (!cards || cards.length < 2) return false;
     if (!playedCardsHistory) playedCardsHistory = [];
 
-    // 1. 所有牌必须是同一门副牌（非主牌）
+    // 1. 判断是主牌甩牌还是副牌甩牌
+    const firstIsTrump = isTrump(cards[0], trumpSuit, level);
+
+    if (firstIsTrump) {
+        // 主牌甩牌：所有牌必须都是主牌
+        for (const card of cards) {
+            if (!isTrump(card, trumpSuit, level)) return false;
+        }
+
+        // 构建所有主牌的候选列表（两副牌中的主牌）
+        const allTrumpCandidates = [];
+        // 主花色普通牌（排除级牌，级牌单独处理）
+        if (trumpSuit) {
+            for (const rank of RANKS) {
+                if (rank === level) continue;
+                for (let di = 0; di < 2; di++) {
+                    allTrumpCandidates.push({ suit: trumpSuit, rank, isJoker: false, deckIndex: di });
+                }
+            }
+        }
+        // 所有级牌（非主花色的级牌 + 主花色的级牌）
+        for (let di = 0; di < 2; di++) {
+            for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
+                allTrumpCandidates.push({ suit, rank: level, isJoker: false, deckIndex: di });
+            }
+        }
+        // 大小王
+        for (const jokerRank of JOKER_RANKS) {
+            for (let di = 0; di < 2; di++) {
+                allTrumpCandidates.push({ suit: SUITS.JOKER, rank: jokerRank, isJoker: true, deckIndex: di });
+            }
+        }
+
+        // 标记已出过的主牌
+        const playedSet = new Set();
+        for (const card of playedCardsHistory) {
+            if (isTrump(card, trumpSuit, level)) {
+                playedSet.add(`${card.isJoker ? 'joker' : card.suit}-${card.rank}-${card.deckIndex}`);
+            }
+        }
+
+        // 标记正在甩的牌
+        const throwSet = new Set();
+        for (const card of cards) {
+            throwSet.add(`${card.isJoker ? 'joker' : card.suit}-${card.rank}-${card.deckIndex}`);
+        }
+
+        // 检查每张甩牌：比它大的主牌是否都已出过或在甩牌中
+        for (const card of cards) {
+            const cardValue = getCardValue(card, trumpSuit, level);
+            for (const candidate of allTrumpCandidates) {
+                const candidateValue = getCardValue(candidate, trumpSuit, level);
+                if (candidateValue <= cardValue) continue;
+
+                const candidateKey = `${candidate.isJoker ? 'joker' : candidate.suit}-${candidate.rank}-${candidate.deckIndex}`;
+                if (!playedSet.has(candidateKey) && !throwSet.has(candidateKey)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // 副牌甩牌：所有牌必须是同一门副牌（非主牌）
     const suit = cards[0].suit;
     for (const card of cards) {
         if (isTrump(card, trumpSuit, level)) return false; // 不能是主牌
@@ -502,8 +567,6 @@ function isThrowValid(cards, trumpSuit, level, playedCardsHistory) {
     }
 
     // 2. 检查这些牌是否都是该门副牌中剩余最大的
-    //    对于出的牌中每张牌，比它大的同花色牌必须都已经出过
-    //    两副牌中该花色的所有牌（排除级牌，因为级牌是主牌）
     const allCardsOfSuit = [];
     for (const rank of RANKS) {
         if (rank === level) continue; // 级牌是主牌，不算副牌
@@ -529,18 +592,13 @@ function isThrowValid(cards, trumpSuit, level, playedCardsHistory) {
     // 对于每张正在甩的牌，检查比它大的牌是否都已出过或在自己手中（即也在甩牌中）
     for (const card of cards) {
         const cardValue = getCardValue(card, trumpSuit, level);
-        // 检查比这张牌大的所有同花色牌
         for (const candidate of allCardsOfSuit) {
             const candidateCard = { suit: candidate.suit, rank: candidate.rank, isJoker: false, deckIndex: candidate.deckIndex };
             const candidateValue = getCardValue(candidateCard, trumpSuit, level);
-            if (candidateValue <= cardValue) continue; // 只看比它大的
+            if (candidateValue <= cardValue) continue;
 
             const candidateKey = `${candidate.suit}-${candidate.rank}-${candidate.deckIndex}`;
-            const isPlayed = playedSet.has(candidateKey);
-            const isInThrow = throwSet.has(candidateKey);
-
-            // 如果比它大的牌既没出过，也不在甩的牌中 → 甩牌不合法
-            if (!isPlayed && !isInThrow) {
+            if (!playedSet.has(candidateKey) && !throwSet.has(candidateKey)) {
                 return false;
             }
         }
@@ -630,7 +688,8 @@ function isValidPlay(playerCards, playedCards, trickCards, trumpSuit, level, pla
             if (playerTractors.length > 0 && playedTractors.length === 0) {
                 return false;
             }
-            if (playerTractors.length === 0 && playerPairs.length >= 2 && playedPairs.length === 0) {
+            // 修正：没拖拉机但有2+对子，必须至少出2个对子
+            if (playerTractors.length === 0 && playerPairs.length >= 2 && playedPairs.length < 2) {
                 return false;
             }
             if (playerTractors.length === 0 && playerPairs.length === 1 && playedPairs.length === 0 &&
@@ -678,8 +737,8 @@ function isValidPlay(playerCards, playedCards, trickCards, trumpSuit, level, pla
             if (playerTractors.length > 0 && playedTractors.length === 0) {
                 return false;
             }
-            // 没拖拉机但有2+对子，必须至少出1个对子
-            if (playerTractors.length === 0 && playerPairs.length >= 2 && playedPairs.length === 0) {
+            // 修正：没拖拉机但有2+对子，必须至少出2个对子
+            if (playerTractors.length === 0 && playerPairs.length >= 2 && playedPairs.length < 2) {
                 return false;
             }
             // 只有1个对子，也必须出
@@ -760,6 +819,109 @@ function findTractorsInCards(cards, trumpSuit, level) {
 }
 
 /**
+ * 分析一组牌的结构（拖拉机、对子、单张）
+ * 修正后用于甩牌毙杀条件判断：需匹配对子数和拖拉机数
+ *
+ * @returns { tractors: Array, pairs: Array, singles: Array }
+ *   tractors: 拖拉机数组，每个是展平的牌数组
+ *   pairs: 对子数组，每个是两张牌
+ *   singles: 单张数组
+ */
+function analyzeCardStructure(cards, trumpSuit, level) {
+    const used = new Set();
+    const tractors = [];
+    const pairs = [];
+
+    // 先找所有对子
+    const allPairs = findPairsInCards(cards, trumpSuit, level);
+
+    // 有2对以上时，检查相邻对子是否能组成拖拉机
+    if (allPairs.length >= 2) {
+        allPairs.sort((a, b) =>
+            getCardValue(a[0], trumpSuit, level) - getCardValue(b[0], trumpSuit, level)
+        );
+        const pairUsed = new Set();
+        for (let i = 0; i < allPairs.length - 1; i++) {
+            if (pairUsed.has(i)) continue;
+            const val1 = getCardValue(allPairs[i][0], trumpSuit, level);
+            const val2 = getCardValue(allPairs[i + 1][0], trumpSuit, level);
+            if (val2 - val1 === 1) {
+                const allTrump1 = allPairs[i].every(c => isTrump(c, trumpSuit, level));
+                const allTrump2 = allPairs[i + 1].every(c => isTrump(c, trumpSuit, level));
+                if (allTrump1 || allTrump2 || allPairs[i][0].suit === allPairs[i + 1][0].suit) {
+                    tractors.push([...allPairs[i], ...allPairs[i + 1]]);
+                    pairUsed.add(i);
+                    pairUsed.add(i + 1);
+                }
+            }
+        }
+        // 标记拖拉机用过的牌
+        for (const t of tractors) {
+            for (const c of t) used.add(c.id);
+        }
+    }
+
+    // 添加所有未被拖拉机使用的对子（包括只有1对的情况）
+    for (const pair of allPairs) {
+        if (!used.has(pair[0].id) && !used.has(pair[1].id)) {
+            pairs.push(pair);
+            used.add(pair[0].id);
+            used.add(pair[1].id);
+        }
+    }
+
+    // 剩余的是单张
+    const singles = cards.filter(c => !used.has(c.id));
+
+    return { tractors, pairs, singles };
+}
+
+/**
+ * 获取甩牌毙杀的强度分数（用于多方毙杀时比较）
+ * 比较规则：拖拉机 > 对子 > 单牌，同类型比value
+ * 返回排序后的强度数组，逐元素比较
+ */
+function getThrowKillStrength(cards, trumpSuit, level) {
+    const struct = analyzeCardStructure(cards, trumpSuit, level);
+    const strengths = [];
+
+    // 拖拉机：基础分10000 + 拖拉机最大牌的value
+    for (const t of struct.tractors) {
+        const maxVal = Math.max(...t.map(c => getCardValue(c, trumpSuit, level)));
+        strengths.push(10000 + maxVal);
+    }
+    // 对子：基础分5000 + 对子的value
+    for (const p of struct.pairs) {
+        strengths.push(5000 + getCardValue(p[0], trumpSuit, level));
+    }
+    // 单张：基础分0 + value
+    for (const s of struct.singles) {
+        strengths.push(getCardValue(s, trumpSuit, level));
+    }
+
+    // 降序排列
+    strengths.sort((a, b) => b - a);
+    return strengths;
+}
+
+/**
+ * 比较两组牌的毙杀强度
+ * @returns {number} 1: cards1强, -1: cards2强, 0: 相等
+ */
+function compareKillStrength(cards1, cards2, trumpSuit, level) {
+    const s1 = getThrowKillStrength(cards1, trumpSuit, level);
+    const s2 = getThrowKillStrength(cards2, trumpSuit, level);
+    const len = Math.max(s1.length, s2.length);
+    for (let i = 0; i < len; i++) {
+        const v1 = s1[i] || 0;
+        const v2 = s2[i] || 0;
+        if (v1 > v2) return 1;
+        if (v1 < v2) return -1;
+    }
+    return 0;
+}
+
+/**
  * 获取首家出的花色
  */
 function getLeadSuit(cards, trumpSuit, level) {
@@ -772,9 +934,10 @@ function getLeadSuit(cards, trumpSuit, level) {
 /**
  * 判断本轮赢家
  *
- * 甩牌的特殊处理：
- *   - 甩牌是某门副牌中剩余最大的牌，同花色跟牌不可能赢
- *   - 只有全主牌且对子数≥甩牌对子数才能杀甩牌
+ * 修正后甩牌的特殊处理：
+ *   - 甩牌可以是主牌或副牌，都是该门花色中剩余最大的牌
+ *   - 杀甩牌条件：全主牌 + 张数相同 + 对子数/拖拉机数 ≥ 甩牌中的对子数/拖拉机数
+ *   - 多方毙杀时，比最强势牌的大小（拖拉机>对子>单牌），再比value
  *   - 混合主副牌（非全主）不算杀，不能赢甩牌
  */
 function getTrickWinner(trickCards, trumpSuit, level, playedCardsHistory) {
@@ -788,24 +951,35 @@ function getTrickWinner(trickCards, trumpSuit, level, playedCardsHistory) {
     if (leadPattern.type === 'throw') {
         // 甩牌的首家默认赢
         let winner = trickCards[0];
-        const leadPairs = countPairsInCards(leadCards, trumpSuit, level);
+        let winnerIsKill = false; // 当前赢家是否是毙杀（全主牌）
+        const leadStruct = analyzeCardStructure(leadCards, trumpSuit, level);
+        const leadTractorCount = leadStruct.tractors.length;
+        const leadPairCount = leadStruct.pairs.length;
 
         for (let i = 1; i < trickCards.length; i++) {
             const cards = trickCards[i].cards;
             const allTrump = cards.every(c => isTrump(c, trumpSuit, level));
             
             if (allTrump) {
-                // 全主牌：检查对子数是否足够杀甩牌
-                const killPairs = countPairsInCards(cards, trumpSuit, level);
-                if (killPairs >= leadPairs) {
-                    // 有效杀牌！比较主牌大小（取最大那张主牌的value）
-                    const winnerMaxTrump = Math.max(...winner.cards.map(c => getCardValue(c, trumpSuit, level)));
-                    const challengerMaxTrump = Math.max(...cards.map(c => getCardValue(c, trumpSuit, level)));
-                    if (challengerMaxTrump > winnerMaxTrump) {
+                // 全主牌：检查拖拉机数和对子数是否足够杀甩牌
+                const killStruct = analyzeCardStructure(cards, trumpSuit, level);
+                const killTractorCount = killStruct.tractors.length;
+                const killPairCount = killStruct.pairs.length;
+
+                // 毙杀条件：拖拉机数≥甩牌拖拉机数 且 对子数≥甩牌对子数
+                if (killTractorCount >= leadTractorCount && killPairCount >= leadPairCount) {
+                    if (!winnerIsKill) {
+                        // 之前是甩牌方（非毙杀），现在毙杀方直接赢
                         winner = trickCards[i];
+                        winnerIsKill = true;
+                    } else {
+                        // 之前也是毙杀，比较毙杀强度（拖拉机>对子>单牌，再比value）
+                        if (compareKillStrength(cards, winner.cards, trumpSuit, level) > 0) {
+                            winner = trickCards[i];
+                        }
                     }
                 }
-                // 对子数不够，不能杀，不改变赢家
+                // 拖拉机/对子数不够，不能杀，不改变赢家
             }
             // 非全主牌（垫牌或同花色小牌）永远不能赢甩牌
         }
@@ -816,6 +990,9 @@ function getTrickWinner(trickCards, trumpSuit, level, playedCardsHistory) {
     let winner = trickCards[0];
     let maxValue = getCardValue(leadCards[0], trumpSuit, level);
     let winnerIsTrump = isTrump(leadCards[0], trumpSuit, level);
+    // 记录当前赢家的花色（用于判断跟牌方是否在垫牌）
+    // 垫牌（不同花色非主牌）永远不能赢，先出为大
+    let winnerSuit = winnerIsTrump ? null : leadCards[0].suit;
     
     for (let i = 1; i < trickCards.length; i++) {
         const cards = trickCards[i].cards;
@@ -841,6 +1018,7 @@ function getTrickWinner(trickCards, trumpSuit, level, playedCardsHistory) {
             winner = trickCards[i];
             maxValue = cardValue;
             winnerIsTrump = true;
+            winnerSuit = null;
             continue;
         }
         
@@ -849,10 +1027,28 @@ function getTrickWinner(trickCards, trumpSuit, level, playedCardsHistory) {
             continue;
         }
         
-        // 同为主牌或同为副牌，比较大小
-        if (cardValue > maxValue) {
-            winner = trickCards[i];
-            maxValue = cardValue;
+        // 同为主牌：比较大小
+        if (winnerIsTrump && cardIsTrump) {
+            if (cardValue > maxValue) {
+                winner = trickCards[i];
+                maxValue = cardValue;
+            }
+            continue;
+        }
+        
+        // 同为副牌：必须跟首家花色才能赢，垫牌（不同花色）永远不能赢
+        // 先出为大：同花色才比点数，不同花色是垫牌直接跳过
+        if (!winnerIsTrump && !cardIsTrump) {
+            // 垫牌（不同花色非主牌）不能赢，先出为大
+            if (card.suit !== winnerSuit) {
+                continue;
+            }
+            // 同花色才比较点数大小
+            if (cardValue > maxValue) {
+                winner = trickCards[i];
+                maxValue = cardValue;
+                winnerSuit = card.suit;
+            }
         }
     }
     
@@ -874,7 +1070,8 @@ function getCardScore(cards) {
 /**
  * 计算升级
  *
- * 注意：分数牌只有5(5分)、10(10分)、K(10分)，所有分数都是5的倍数。
+ * 注意：分数牌只有5(5分)、10(10分)、K(10分)，两副牌总分200分。
+ * 所有分数都是5的倍数。通常只计算闲家方得分。
  *
  * 庄家方（守擂成功，闲家得分 < 80）：
  *   0分      → 升3级
@@ -883,14 +1080,15 @@ function getCardScore(cards) {
  *   （76-79分在实际中不会出现，因为分数都是5的倍数）
  *
  * 闲家方（上台，闲家得分 ≥ 80）：
- *   80-115分  → 升1级
- *   120-155分 → 升2级（每多40分多升1级）
- *   160-195分 → 升3级
- *   200-235分 → 升4级
- *   240-275分 → 升5级
+ *   80-119分  → 仅获得庄家身份，不升级
+ *   120-159分 → 升1级（每比80多40分多升1级）
+ *   160-199分 → 升2级
+ *   200-239分 → 升3级
+ *   240-279分 → 升4级
  *   ……以此类推
  *
- * 公式：score >= 80 时，upgrade = floor((score - 76) / 40) + 1
+ * 公式：score >= 80 时，upgrade = max(0, floor((score - 80) / 40))
+ * 即80分只是上台门槛，每比80多出40分才开始多升1级。
  */
 function calculateUpgrade(score, isDealerTeam) {
     if (isDealerTeam) {
@@ -901,18 +1099,33 @@ function calculateUpgrade(score, isDealerTeam) {
         return 0; // 76-79分：守擂成功但不升级
     } else {
         // 闲家上台（闲家得分 >= 80）
-        // 80-115升1级，每多40分多升1级
-        return Math.floor((score - 76) / 40) + 1;
+        // 80-119仅获得庄家身份不升级，每比80多40分多升1级
+        return Math.max(0, Math.floor((score - 80) / 40));
     }
 }
 
 /**
- * 获取下一个级别
+ * 获取下一个级别（含必打规则）
+ *
+ * 必打级别：5、10、K、A
+ * 无论通过守擂升级还是闲家抓分跳级，只要升级跨越这些级别，
+ * 都必须忽略跳级的额外部分，落在这个必打级别上。
+ * 打A时须守擂成功一次才算全局获胜。
  */
 function getNextLevel(currentLevel, upgrade) {
     const levels = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
+    const mustPlayLevels = ['5', '10', 'K', 'A']; // 必打级别
     const idx = levels.indexOf(currentLevel);
-    const newIdx = Math.min(idx + upgrade, levels.length - 1);
+    let newIdx = Math.min(idx + upgrade, levels.length - 1);
+
+    // 必打规则：如果升级跨越了必打级别，落在该级别上
+    for (let i = idx + 1; i <= newIdx; i++) {
+        if (mustPlayLevels.includes(levels[i])) {
+            newIdx = i; // 落在遇到的第一个必打级别
+            break;
+        }
+    }
+
     return levels[newIdx];
 }
 
@@ -949,6 +1162,7 @@ class GameState {
         this.trickScores = { teamA: 0, teamB: 0 }; // 本轮得分
         this.lastTrickInfo = null; // 最后一轮的牌型信息（供抠底倍数计算）
         this.playedCardsHistory = []; // 本局所有已出过的牌（供甩牌验证）
+        this.failedThrows = []; // 记录甩错的牌型（供AI避免再次甩错）
         
         // 叫主状态
         this.bidState = {
@@ -1123,6 +1337,74 @@ class GameState {
         }
     }
     
+    /**
+     * 验证甩牌并处理甩错惩罚
+     * 修正：甩错要惩罚，收回甩牌重新出牌
+     *   - 闲家甩错：闲家方减分（甩牌张数×10）
+     *   - 庄家方甩错：闲家方加分（甩牌张数×10）
+     *
+     * @param {string} position - 出牌玩家
+     * @param {Array} cards - 甩出的牌
+     * @returns {Object} { valid: boolean, penalty: number, message: string }
+     */
+    validateThrow(position, cards) {
+        // 单张不需要甩牌验证
+        if (!cards || cards.length < 2) {
+            return { valid: true, penalty: 0, message: '' };
+        }
+
+        const pattern = getCardPattern(cards, this.trumpSuit, this.level, this.playedCardsHistory);
+
+        // 合法牌型（单张、对子、拖拉机）或合法甩牌，不需要惩罚
+        if (pattern.type === 'single' || pattern.type === 'pair' ||
+            pattern.type === 'tractor' || pattern.type === 'throw') {
+            return { valid: true, penalty: 0, message: '' };
+        }
+
+        // pattern.type === 'invalid'：判断是否是甩牌尝试
+        // 甩牌尝试 = 2+张同花色副牌 或 2+张全主牌（但不是合法对子/拖拉机）
+        const allTrump = cards.every(c => isTrump(c, this.trumpSuit, this.level));
+        let isThrowAttempt = false;
+        if (allTrump) {
+            isThrowAttempt = true;
+        } else {
+            const allNonTrump = cards.every(c => !isTrump(c, this.trumpSuit, this.level));
+            if (allNonTrump) {
+                const suit = cards[0].suit;
+                isThrowAttempt = cards.every(c => c.suit === suit);
+            }
+        }
+
+        // 不是甩牌尝试（混合花色等），不作为甩错处理
+        if (!isThrowAttempt) {
+            return { valid: true, penalty: 0, message: '' };
+        }
+
+        // 甩错！计算惩罚
+        const penalty = cards.length * 10;
+        const isDealerTeam = TEAMS.TEAM_A.includes(this.dealer) === TEAMS.TEAM_A.includes(position);
+        const dealerTeamKey = TEAMS.TEAM_A.includes(this.dealer) ? 'teamA' : 'teamB';
+        const attackerTeamKey = dealerTeamKey === 'teamA' ? 'teamB' : 'teamA';
+
+        if (isDealerTeam) {
+            // 庄家方甩错 → 闲家加分
+            this.trickScores[attackerTeamKey] += penalty;
+        } else {
+            // 闲家甩错 → 闲家减分（不低于0）
+            this.trickScores[attackerTeamKey] = Math.max(0, this.trickScores[attackerTeamKey] - penalty);
+        }
+
+        // 记录甩错的牌型（供AI避免再次甩错）
+        const failKey = cards.map(c => `${c.suit}-${c.rank}`).sort().join(',');
+        this.failedThrows.push({ player: position, key: failKey, cards: cards.map(c => c.id) });
+
+        return {
+            valid: false,
+            penalty: penalty,
+            message: `甩牌不合法！${isDealerTeam ? '庄家方' : '闲家方'}甩错，${isDealerTeam ? '闲家加分' : '闲家减分'}${penalty}分`
+        };
+    }
+    
     endTrick() {
         const winner = getTrickWinner(this.currentTrick, this.trumpSuit, this.level, this.playedCardsHistory);
         const score = getCardScore(this.currentTrick.flatMap(t => t.cards));
@@ -1259,12 +1541,21 @@ class GameState {
         }
         
         this.phase = 'ended';
+        this.lastRoundResult = result;
         return result;
     }
     
-    checkGameOver() {
-        if (this.teamLevels.teamA === 'A') return 'teamA';
-        if (this.teamLevels.teamB === 'A') return 'teamB';
+    checkGameOver(lastRoundResult) {
+        // A必打规则：打A时须做庄守擂成功一次才算全局获胜
+        // 只有庄家方在A级别且刚刚守擂成功（闲家得分<80），才算获胜
+        if (lastRoundResult && lastRoundResult.winner) {
+            const winnerTeam = lastRoundResult.winner;
+            // 检查赢方是否是守擂成功的庄家方（非闲家上台）
+            const dealerWon = lastRoundResult.attackerScore < 80;
+            if (dealerWon && this.teamLevels[winnerTeam] === 'A') {
+                return winnerTeam;
+            }
+        }
         return null;
     }
     
@@ -1285,6 +1576,7 @@ class GameState {
         this.trickScores = { teamA: 0, teamB: 0 };
         this.lastTrickInfo = null;
         this.playedCardsHistory = [];
+        this.failedThrows = [];
         this.bidState = {
             currentBid: null,
             bidHistory: [],
@@ -1303,6 +1595,7 @@ if (typeof module !== 'undefined' && module.exports) {
         findLevelPairs, findJokerPairs, canCounterBid, getAvailableBids,
         findPairsInCards, findTractorsInCards, isCardPair,
         isThrowValid, countPairsInCards,
+        analyzeCardStructure, getThrowKillStrength, compareKillStrength,
         BID_TYPES, BID_POWER,
         SUITS, RANKS, PLAYERS, TEAMS, SUIT_SYMBOLS
     };
