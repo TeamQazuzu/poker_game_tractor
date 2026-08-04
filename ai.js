@@ -34,6 +34,18 @@ class TractorAI {
     reset() {
         this.memory = {
             playedCards: [],     // 已出过的牌
+            playerCards: {       // 各玩家出过的牌（用于追踪主牌消耗等）
+                left: [],
+                top: [],
+                right: [],
+                bottom: []
+            },
+            trumpsByPlayer: {    // 各玩家已出过的主牌数量
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0
+            },
             suitVoid: {          // 记录各玩家断掉的花色
                 left: new Set(),
                 top: new Set(),
@@ -45,7 +57,8 @@ class TractorAI {
             teammateSmallTrumpLeads: 0,  // 队友首发出小主牌的次数
             lastSmallTrumpLeadTrick: -1, // 上次记录小主牌首发的轮次（防重复计数）
             bottomPoints: null,  // 底牌分数（庄家AI埋底后记录，用于判断是否需要保底策略）
-            dealer: null         // 当前庄家位置（由decidePlay同步）
+            dealer: null,        // 当前庄家位置（由decidePlay同步）
+            bigPairsLedBySuit: new Set() // 记录出过大对子（A/K/Q对）的花色
         };
     }
 
@@ -87,11 +100,36 @@ class TractorAI {
         // 记录已出的牌
         this.memory.playedCards.push(...cards);
 
+        // 追踪各玩家出过的牌（用于主牌消耗等分析）
+        if (this.memory.playerCards[player]) {
+            this.memory.playerCards[player].push(...cards);
+        }
+
+        // 追踪各玩家出过的主牌数量
+        if (this.memory.trumpsByPlayer) {
+            const trumpsInPlay = cards.filter(c => isTrump(c, trumpSuit, level));
+            this.memory.trumpsByPlayer[player] = (this.memory.trumpsByPlayer[player] || 0) + trumpsInPlay.length;
+        }
+
         // 如果该玩家没有跟首家花色（出的是主牌或垫其他花色），记录该玩家断了该花色
         if (leadSuit !== null && player !== this.position) {
             const followedSuit = cards.some(c => !c.isJoker && c.suit === leadSuit && !isTrump(c, trumpSuit, level));
             if (!followedSuit) {
                 this.memory.suitVoid[player].add(leadSuit);
+            }
+        }
+
+        // 首家出牌时（leadSuit为null），记录是否出了大对子（A/K/Q对）
+        // 用于_hasTestedBigPairInSuit判断：出过大对子且对手没跟对子，说明对手可能没对子了
+        if (leadSuit === null && cards.length >= 2 && !cards[0].isJoker) {
+            const pattern = getCardPattern(cards, trumpSuit, level, this.memory.playedCards);
+            if (pattern.type === 'pair' || pattern.type === 'tractor') {
+                const pairSuit = cards[0].suit;
+                // 检查是否包含大对子（A/K/Q对）
+                const bigRanks = ['A', 'K', 'Q'];
+                if (bigRanks.includes(cards[0].rank) && !isTrump(cards[0], trumpSuit, level)) {
+                    this.memory.bigPairsLedBySuit.add(pairSuit);
+                }
             }
         }
     }
@@ -105,16 +143,28 @@ class TractorAI {
 
     /**
      * 统计某玩家在某花色已出过的牌数（用于判断断门可能性）
-     * position: 1=首家 2=二家 3=三家 4=四家
+     * @param {string} suit - 花色
+     * @param {number} position - 出牌位置：1=首家 2=二家 3=三家 4=四家
+     * @param {string} leadPlayer - 首家玩家位置（用于将position映射到实际玩家）
+     * @returns {number} 该玩家在该花色已出过的牌数
      */
-    _countSuitPlayedByPlayer(suit, position) {
-        const playerMap = { 1: 'bottom', 2: 'right', 3: 'top', 4: 'left' };
-        // 注：PLAYERS顺序是 bottom→right→top→left，对应1→2→3→4
-        // 但实际出牌顺序取决于首家，这里用近似统计：
-        // 统计该花色在已出牌历史中出现的总次数（粗略估计四家可能的走牌量）
-        return this.memory.playedCards.filter(c =>
-            !c.isJoker && c.suit === suit
-        ).length;
+    _countSuitPlayedByPlayer(suit, position, leadPlayer) {
+        if (!leadPlayer) {
+            // 无leadPlayer时退化为全局统计
+            return this.memory.playedCards.filter(c =>
+                !c.isJoker && c.suit === suit
+            ).length;
+        }
+
+        // 将position映射到实际玩家
+        // PLAYERS = ['bottom', 'right', 'top', 'left']，出牌顺序按此数组循环
+        const leadIdx = PLAYERS.indexOf(leadPlayer);
+        const playerIdx = (leadIdx + position - 1) % PLAYERS.length;
+        const player = PLAYERS[playerIdx];
+
+        // 从该玩家的出牌记录中统计该花色的牌数
+        const playerCards = this.memory.playerCards[player] || [];
+        return playerCards.filter(c => !c.isJoker && c.suit === suit).length;
     }
 
     /**
@@ -248,46 +298,54 @@ class TractorAI {
     }
 
     /**
-     * 找到用于拦截的副牌
+     * 找到用于拦截的副牌（通用版，需比较当前赢家牌值）
      *
      * 拦截策略：用J/Q等中级牌拦截，防止最后一家出10得分的可能性。
-     * - 不用A（中盘AK大概率走完了，留着也是浪费）
-     * - 不用K（如果有K是最后一家的那是他的分，拦不住）
-     * - 优先用J/Q，其次用其他中级牌（7~9如果比当前赢家大）
+     * - 不用A（A属于控场，应留给杀K等更关键的用途）
+     * - 不用K（K是分牌，四家可压过K拿10分）
+     * - 优先用Q，其次J，再次7/8/9（均需能赢过当前赢家）
      * - 不用分牌（5/10/K）
      * - 不拆对子
      *
      * @param {Array} leadSuitCards - 该花色的手牌（已排序，小→大）
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @param {number} winnerValue - 当前赢家的牌值（必须出比这大的牌）
      * @returns {Object|null} 拦截牌，或null
      */
-    _findInterceptCard(leadSuitCards, trumpSuit, level) {
+    _findInterceptCard(leadSuitCards, trumpSuit, level, winnerValue) {
         if (!leadSuitCards || leadSuitCards.length === 0) return null;
+        if (winnerValue === undefined) return null;
 
-        // 找出当前赢家的牌值
-        // leadSuitCards已排序小→大，我们需要出一张比当前赢家大的中级牌
+        const pairs = this._findPairs(leadSuitCards, trumpSuit, level);
+        const isInPair = (card) => pairs.some(p => p.some(pc => pc.id === card.id));
 
-        // 优先用J或Q拦截（最理想的拦截牌）
-        const jqCards = leadSuitCards.filter(c => {
-            if (this._isPointCard(c)) return false; // 不用分牌
-            const val = getCardValue(c, trumpSuit, level);
-            // J=9, Q=10 在RANKS中的index，副牌value就是index
-            return c.rank === 'J' || c.rank === 'Q';
+        // 优先用Q拦截
+        const queen = leadSuitCards.find(c => {
+            if (c.rank !== 'Q') return false;
+            if (this._isPointCard(c)) return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
+            return !isInPair(c);
         });
-        if (jqCards.length > 0) {
-            return jqCards[0]; // 最小的J或Q
-        }
+        if (queen) return queen;
 
-        // 没有J/Q，看有没有其他中级非分牌（7/8/9）比当前桌面最大牌大
-        // 找出非分牌中最大的
+        // 其次用J拦截
+        const jack = leadSuitCards.find(c => {
+            if (c.rank !== 'J') return false;
+            if (this._isPointCard(c)) return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
+            return !isInPair(c);
+        });
+        if (jack) return jack;
+
+        // 再次用7/8/9中最大的能赢的牌
         const midCards = leadSuitCards.filter(c => {
             if (this._isPointCard(c)) return false;
-            // 排除A（太大，留着）和K（是分牌已被排除）
-            if (c.rank === 'A') return false;
+            if (c.rank === 'A' || c.rank === 'K') return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
             return ['7', '8', '9'].includes(c.rank);
         });
-        if (midCards.length > 0) {
-            return midCards[midCards.length - 1]; // 最大的中级牌
-        }
+        if (midCards.length > 0) return midCards[midCards.length - 1];
 
         // 实在没有合适的拦截牌，返回null（走默认逻辑）
         return null;
@@ -319,7 +377,8 @@ class TractorAI {
         const pairs = this._findPairs(leadSuitCards, trumpSuit, level);
         const isInPair = (card) => pairs.some(p => p.some(pc => pc.id === card.id));
 
-        // 1. 优先用A（绝对大牌上手）——不拆对
+        // 1. 优先用A（绝对大牌上手=控场）——不拆对
+        //    注意：用A属于"控场"而非"拦截"，但在拦截场景下若手中有A且愿意上手也是合理选择
         const ace = leadSuitCards.find(c => {
             if (c.rank !== 'A') return false;
             if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
@@ -327,22 +386,23 @@ class TractorAI {
         });
         if (ace) return ace;
 
-        // 2. 用K（分牌但在拦截场景可接受）——不拆对
-        const king = leadSuitCards.find(c => {
-            if (c.rank !== 'K') return false;
-            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
-            return !isInPair(c);
-        });
-        if (king) return king;
-
-        // 3. 用J/Q拦截
-        const jq = leadSuitCards.find(c => {
-            if (c.rank !== 'J' && c.rank !== 'Q') return false;
+        // 2. 用Q拦截（不用K——K是分牌，四家可压过K拿10分）
+        const queen = leadSuitCards.find(c => {
+            if (c.rank !== 'Q') return false;
             if (this._isPointCard(c)) return false;
             if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
             return !isInPair(c);
         });
-        if (jq) return jq;
+        if (queen) return queen;
+
+        // 3. 用J拦截
+        const jack = leadSuitCards.find(c => {
+            if (c.rank !== 'J') return false;
+            if (this._isPointCard(c)) return false;
+            if (getCardValue(c, trumpSuit, level) <= winnerValue) return false;
+            return !isInPair(c);
+        });
+        if (jack) return jack;
 
         // 4. 用7/8/9中最大的能赢的牌
         const midCards = leadSuitCards.filter(c => {
@@ -637,6 +697,7 @@ class TractorAI {
         let opponentRemains = false;
         for (let i = playedCount; i < 4; i++) {
             const p = players[(leadIdx + i) % 4];
+            if (p === this.position) continue; // 排除自己（自己知道手牌，不算未知对手）
             if (this._isTeammate(p)) continue; // 队友不会反超自己人
             opponentRemains = true;
             // 对手断门 → 可能杀主反超
@@ -699,8 +760,8 @@ class TractorAI {
             if (val <= winnerValue) continue; // 必须能赢当前赢家
 
             let priority = 0;
-            if (t.isJoker && t.rank === 'small') priority = 100;
-            else if (t.isJoker && t.rank === 'big') priority = 99;
+            if (t.isJoker && t.rank === 'big') priority = 100;    // 大王优先（确保绝对抢权）
+            else if (t.isJoker && t.rank === 'small') priority = 99; // 小王次之
             else if (!t.isJoker && t.rank === level && t.suit === trumpSuit) priority = 90;
             else if (!t.isJoker && t.rank === level) priority = 80;
             else priority = val;
@@ -1302,18 +1363,28 @@ class TractorAI {
                 usedIds.add(card.id);
             }
         }
-        // 如果有效牌不够，从手中补足
-        if (validResult.length < needLen) {
-            for (const card of hand) {
-                if (validResult.length >= needLen) break;
-                if (!usedIds.has(card.id)) {
-                    validResult.push(card);
-                    usedIds.add(card.id);
+        // 首家出牌时，出牌张数由策略决定（可能是单张/对子/拖拉机/甩牌），
+        // 不能截断为 needLen=1；跟牌时必须和首家张数一致
+        if (trickCards.length === 0) {
+            // 首家：不截断，但确保至少有1张牌
+            if (validResult.length === 0) {
+                result = this._fallbackPlay(hand, 1, trumpSuit, level);
+            } else {
+                result = validResult;
+            }
+        } else {
+            // 跟牌：补足或截断到 needLen
+            if (validResult.length < needLen) {
+                for (const card of hand) {
+                    if (validResult.length >= needLen) break;
+                    if (!usedIds.has(card.id)) {
+                        validResult.push(card);
+                        usedIds.add(card.id);
+                    }
                 }
             }
+            result = validResult.slice(0, needLen);
         }
-        // 如果多了，截断
-        result = validResult.slice(0, needLen);
 
         // 调试日志
         if (result && result.length > 0) {
@@ -1589,75 +1660,321 @@ class TractorAI {
         return [cards[0]];
     }
 
+    // ================================================================
+    //  强势度评估辅助方法
+    // ================================================================
+
     /**
-     * 评估单张副牌的强势度
-     * 100 = 此牌在当前局势下是这门花色最大单张
-     * 
-     * @param {Object} card - 要评估的牌
-     * @param {string} trumpSuit - 主花色
-     * @param {string} level - 级别
-     * @returns {number} 强势度分数 (0-100)
+     * 统计主牌总数（两副牌）
+     * 有主：主花色26 + 非主花色级牌6 + 大小王4 = 36
+     * 无主：级牌8 + 大小王4 = 12
      */
-    _evaluateSingleStrength(card, trumpSuit, level) {
-        if (card.isJoker || isTrump(card, trumpSuit, level)) return 0;
-        
-        const suit = card.suit;
-        const rank = card.rank;
-        
-        // 统计该花色各点数已出数量（排除级牌，因为级牌是主牌）
-        const count = (r) => this.memory.playedCards.filter(c => 
-            c.suit === suit && c.rank === r && !isTrump(c, trumpSuit, level)
-        ).length;
-        
-        if (rank === 'A') return 100;                    // 永远是最大副牌
-        if (rank === 'K' && count('A') >= 2) return 95;  // AA出完，K最大
-        if (rank === 'Q' && count('A') >= 2 && count('K') >= 2) return 90;
-        if (rank === 'J' && count('A') >= 2 && count('K') >= 2 && count('Q') >= 2) return 85;
-        if (rank === '10' && count('A') >= 2 && count('K') >= 2 && count('Q') >= 2 && count('J') >= 2) return 80;
-        
-        return 0; // 不够强势，走送权策略
+    _countTotalTrumps(trumpSuit, level) {
+        if (trumpSuit === null) {
+            return 12; // 无主：8张级牌 + 4张王
+        }
+        return 36; // 主花色26 + 非主花色级牌6 + 王4
     }
 
     /**
-     * 评估对子的强势度
-     * 
+     * 获取某玩家剩余手牌数
+     * 初始25张，减去已出牌数
+     */
+    _getPlayerRemainingCardCount(player) {
+        const initialCards = 25;
+        const playedCount = (this.memory.playerCards[player] || []).length;
+        return Math.max(0, initialCards - playedCount);
+    }
+
+    /**
+     * 统计场上剩余的主牌中，不在自己手中的数量
+     * = 主牌总数 - 所有已出主牌 - 自己手中的主牌
+     */
+    _countRemainingTrumpsOutsideSelf(trumpSuit, level, hand) {
+        const totalTrumps = this._countTotalTrumps(trumpSuit, level);
+        let allTrumpsPlayed = 0;
+        for (const p of PLAYERS) {
+            allTrumpsPlayed += this.memory.trumpsByPlayer[p] || 0;
+        }
+        const myTrumps = hand.filter(c => isTrump(c, trumpSuit, level)).length;
+        return Math.max(0, totalTrumps - allTrumpsPlayed - myTrumps);
+    }
+
+    /**
+     * 判断对手是否能毙杀该花色的单张
+     * 条件：某对手断门该花色，且场上有剩余主牌不在自己手中，且该对手还有手牌
+     *
+     * @param {string} suit - 副牌花色
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @param {Array} hand - 自己手牌
+     * @returns {boolean}
+     */
+    _canOpponentKill(suit, trumpSuit, level, hand) {
+        const trumpsOutsideMe = this._countRemainingTrumpsOutsideSelf(trumpSuit, level, hand);
+        if (trumpsOutsideMe <= 0) return false; // 其他玩家都没有主牌了
+
+        for (const player of PLAYERS) {
+            if (player === this.position) continue;
+            if (this._isTeammate(player)) continue; // 队友不会杀我们
+
+            // 该对手断了该花色
+            if (this.memory.suitVoid[player] && this.memory.suitVoid[player].has(suit)) {
+                const remainingCards = this._getPlayerRemainingCardCount(player);
+                if (remainingCards > 0) {
+                    return true; // 断门且有手牌，可能有主牌可杀
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 判断对手是否能毙杀该花色的对子
+     * 杀对子需要主牌对子，门槛更高
+     *
+     * @param {string} suit - 副牌花色
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @param {Array} hand - 自己手牌
+     * @returns {boolean}
+     */
+    _canOpponentKillPair(suit, trumpSuit, level, hand) {
+        const trumpsOutsideMe = this._countRemainingTrumpsOutsideSelf(trumpSuit, level, hand);
+        if (trumpsOutsideMe < 2) return false; // 杀对子至少需要2张主牌
+
+        for (const player of PLAYERS) {
+            if (player === this.position) continue;
+            if (this._isTeammate(player)) continue;
+
+            if (this.memory.suitVoid[player] && this.memory.suitVoid[player].has(suit)) {
+                const remainingCards = this._getPlayerRemainingCardCount(player);
+                if (remainingCards >= 2) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 统计某花色中比指定牌大的副牌还有多少张未下场（不在已出牌中，也不在自己手中）
+     *
+     * @param {Object} card - 要评估的牌
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @param {Array} hand - 自己手牌
+     * @returns {number} 剩余更大的牌数量
+     */
+    _countRemainingHigher(card, trumpSuit, level, hand) {
+        const suit = card.suit;
+        const cardValue = getCardValue(card, trumpSuit, level);
+
+        // 获取该花色所有比card大的rank（排除级牌，因为级牌是主牌）
+        const higherRanks = RANKS.filter(r => {
+            if (r === level) return false;
+            const tempCard = { suit, rank: r, isJoker: false };
+            return !isTrump(tempCard, trumpSuit, level) &&
+                   getCardValue(tempCard, trumpSuit, level) > cardValue;
+        });
+
+        let remaining = 0;
+        for (const rank of higherRanks) {
+            const total = 2; // 两副牌
+            const played = this.memory.playedCards.filter(c =>
+                !c.isJoker && c.suit === suit && c.rank === rank && !isTrump(c, trumpSuit, level)
+            ).length;
+            const inHand = hand.filter(c =>
+                !c.isJoker && c.suit === suit && c.rank === rank && !isTrump(c, trumpSuit, level)
+            ).length;
+            remaining += Math.max(0, total - played - inHand);
+        }
+        return remaining;
+    }
+
+    /**
+     * 统计某花色中比指定rank大的rank里，还有多少rank有成对的可能（两张都未下场）
+     * 用于对子强势度评估
+     *
+     * @param {string} rank - 对子的rank
+     * @param {string} suit - 对子的花色
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @param {Array} hand - 自己手牌
+     * @returns {number} 可能存在更高对子的rank数量
+     */
+    _countRemainingHigherPairs(rank, suit, trumpSuit, level, hand) {
+        const cardValue = getCardValue({ suit, rank, isJoker: false }, trumpSuit, level);
+
+        const higherRanks = RANKS.filter(r => {
+            if (r === level) return false;
+            const tempCard = { suit, rank: r, isJoker: false };
+            return !isTrump(tempCard, trumpSuit, level) &&
+                   getCardValue(tempCard, trumpSuit, level) > cardValue;
+        });
+
+        let possiblePairs = 0;
+        for (const r of higherRanks) {
+            const total = 2;
+            const played = this.memory.playedCards.filter(c =>
+                !c.isJoker && c.suit === suit && c.rank === r && !isTrump(c, trumpSuit, level)
+            ).length;
+            const inHand = hand.filter(c =>
+                !c.isJoker && c.suit === suit && c.rank === r && !isTrump(c, trumpSuit, level)
+            ).length;
+            const remaining = Math.max(0, total - played - inHand);
+            if (remaining >= 2) {
+                possiblePairs++;
+            }
+        }
+        return possiblePairs;
+    }
+
+    /**
+     * 统计某花色中比指定rank大的rank里，还有多少张未下场的单张
+     * （即可能散落在对手手中成为更大单张的牌）
+     * 用于对子评估中的被杀概率估算
+     */
+    _countRemainingHigherSingles(rank, suit, trumpSuit, level, hand) {
+        const cardValue = getCardValue({ suit, rank, isJoker: false }, trumpSuit, level);
+
+        const higherRanks = RANKS.filter(r => {
+            if (r === level) return false;
+            const tempCard = { suit, rank: r, isJoker: false };
+            return !isTrump(tempCard, trumpSuit, level) &&
+                   getCardValue(tempCard, trumpSuit, level) > cardValue;
+        });
+
+        let remaining = 0;
+        for (const r of higherRanks) {
+            const total = 2;
+            const played = this.memory.playedCards.filter(c =>
+                !c.isJoker && c.suit === suit && c.rank === r && !isTrump(c, trumpSuit, level)
+            ).length;
+            const inHand = hand.filter(c =>
+                !c.isJoker && c.suit === suit && c.rank === r && !isTrump(c, trumpSuit, level)
+            ).length;
+            remaining += Math.max(0, total - played - inHand);
+        }
+        return remaining;
+    }
+
+    // ================================================================
+    //  强势度评估核心方法
+    // ================================================================
+
+    /**
+     * 评估单张副牌的强势度（二值逻辑：0 或 100）
+     *
+     * 核心原则：
+     *   单张的被杀可能性几乎是"全或无"——要么一定会被杀，要么一定不会被杀。
+     *   不存在中间概率。通过动态分析得出100%或0%。
+     *
+     * 100%条件（全部满足）：
+     *   1. 所有比这张牌大的同花色副牌都已下场（已出或在自己手中）
+     *      → 没有人能用更大的同花色牌压住
+     *   2. 没有对手能毙杀（断门该花色且有主牌的对手不存在）
+     *      → 没有人能用主牌杀
+     *
+     * 特殊情况：
+     *   - 若对手断门该花色但手中已无主牌，则条件2满足（无法毙杀）
+     *   - A永远是该花色最大副牌，只要条件2满足就是100%
+     *
+     * @param {Object} card - 要评估的牌
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @param {Array} hand - 自己手牌（用于结合自身牌面判断）
+     * @returns {number} 强势度分数 (0 或 100)
+     */
+    _evaluateSingleStrength(card, trumpSuit, level, hand) {
+        // 主牌不在此评估范围
+        if (card.isJoker || isTrump(card, trumpSuit, level)) return 0;
+
+        const suit = card.suit;
+
+        // 1. 检查是否所有比这张牌大的同花色副牌都已下场
+        const remainingHigher = this._countRemainingHigher(card, trumpSuit, level, hand);
+        if (remainingHigher > 0) {
+            return 0; // 还有更大的牌在外面，不是绝对大牌
+        }
+
+        // 2. 所有更大的牌都已下场，检查是否会被对手毙杀
+        if (this._canOpponentKill(suit, trumpSuit, level, hand)) {
+            return 0; // 对手断门且有主牌，可以被毙杀
+        }
+
+        // 3. 所有更大的牌都已下场，且对手无法毙杀 → 绝对大牌
+        return 100;
+    }
+
+    /**
+     * 评估对子的强势度（动态梯度 + 可提升至100%）
+     *
+     * 核心原则：
+     *   对子很难做出绝对判断，可以有强势度的梯度分布。
+     *   但如果记牌结合自身牌面能确定所有更高对子都已不存在，可提升至100%。
+     *
+     * 100%条件（全部满足）：
+     *   1. 所有比这对大的rank，要么两张都已出/在手中，要么至少出了一张（无法成对）
+     *      → 没有更高的对子能压住
+     *   2. 没有对手能用主牌对子毙杀
+     *
+     * 梯度评估（无法确定100%时）：
+     *   根据剩余可能更高对子的数量，给出概率梯度：
+     *   - 0个可能更高对子 + 无法被毙杀 → 100%
+     *   - 0个可能更高对子 + 可能被毙杀 → 70%（主牌对子较稀有）
+     *   - 1个可能更高对子 → 80%
+     *   - 2个可能更高对子 → 60%
+     *   - 3+个可能更高对子 → 40%
+     *
+     *   如果之前出过大对子且对手没跟对子，提升强势度（对手可能没对子了）
+     *
      * @param {Array} pair - 对子数组（两张牌）
      * @param {string} trumpSuit - 主花色
      * @param {string} level - 级别
+     * @param {Array} hand - 自己手牌
      * @returns {number} 强势度分数 (0-100)
      */
-    _evaluatePairStrength(pair, trumpSuit, level) {
+    _evaluatePairStrength(pair, trumpSuit, level, hand) {
         const suit = pair[0].suit;
         const rank = pair[0].rank;
-        const count = (r) => this.memory.playedCards.filter(c => 
-            c.suit === suit && c.rank === r && !isTrump(c, trumpSuit, level)
-        ).length;
-        
-        if (rank === 'A') return 100;
-        
-        // K对：出过1张A即可（剩1张A无法成对）
-        if (rank === 'K' && count('A') >= 1) return 95;
-        
-        // Q对：A和K各出过至少1张
-        if (rank === 'Q' && count('A') >= 1 && count('K') >= 1) {
-            if (count('A') >= 2 && count('K') >= 2) return 95; // 都出完了，必最大
-            return 85; // 外面最多1A1K，成对概率极低
+
+        // 主牌对子不在此评估范围
+        if (isTrump(pair[0], trumpSuit, level)) return 0;
+
+        // 1. 统计还有多少更高rank可能成对
+        const remainingHigherPairs = this._countRemainingHigherPairs(rank, suit, trumpSuit, level, hand);
+
+        // 2. 检查对手是否能用主牌对子毙杀
+        const canBeKilled = this._canOpponentKillPair(suit, trumpSuit, level, hand);
+
+        // 3. 如果没有更高的对子可能存在
+        if (remainingHigherPairs === 0) {
+            if (canBeKilled) {
+                // 对手可能用主牌对子杀，但主牌对子较稀有，给70%
+                return 70;
+            }
+            // 绝对大牌对子
+            return 100;
         }
-        
-        // J对：大牌出过较多
-        if (rank === 'J' && count('A') + count('K') + count('Q') >= 3) {
-            if (count('A') >= 2 && count('K') >= 2 && count('Q') >= 2) return 90;
-            return 75;
-        }
-        
-        // 推断性强势：出过大对子测试后，对手可能没对子
+
+        // 4. 概率梯度评估
+        let strength;
+        if (remainingHigherPairs === 1) strength = 80;
+        else if (remainingHigherPairs === 2) strength = 60;
+        else strength = 40;
+
+        // 5. 推断性提升：出过大对子且对手没跟对子，说明对手可能没对子了
         if (this._hasTestedBigPairInSuit(suit, trumpSuit, level)) {
-            // 小对子也可能是最大的，rank越大（越接近A）强势度越高
-            const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
-            return 40 + RANKS.indexOf(rank) * 2;
+            strength = Math.min(95, strength + 20);
         }
-        
-        return 0;
+
+        // 6. 被毙杀风险降低强势度
+        if (canBeKilled) {
+            strength = Math.floor(strength * 0.5);
+        }
+
+        return strength;
     }
 
     /**
@@ -1713,9 +2030,9 @@ class TractorAI {
         allPairs.sort((a, b) => b.value - a.value); // 大到小
 
         // 第一轮：确定性出牌——A对、K对
+        // 对手断门时不跳过：对手只能用主牌对子毙杀，赌对手无主牌对子，
+        // 即使有，消耗对手主牌对子也很值得，且该门分数可能所剩不多
         for (const item of allPairs) {
-            if (item.oppVoid) continue; // 对手都断了，不出
-
             if (item.rank === 'A') {
                 // A对：拆单张利于队友跑分，出对子逼对手对子
                 // 两种策略各50%概率，增加AI不可预测性
@@ -1738,26 +2055,28 @@ class TractorAI {
 
         // 第二轮：概率性出牌——Q对、J对、10对
         for (const item of allPairs) {
-            if (item.oppVoid) continue;
-
             const prob = PROB[item.rank];
             if (prob !== undefined) {
+                // 对手断门时提高出牌概率：对手只能用主牌对子毙杀，风险更低
+                let adjustedProb = prob;
+                if (item.oppVoid) {
+                    adjustedProb = Math.min(prob + 0.2, 0.95);
+                }
                 // 检查是否有更高级的牌还没出完
                 // Q对：如果A/K还没出完，被压的概率更高，降低出牌概率
-                let adjustedProb = prob;
                 if (item.rank === 'Q') {
                     const aPlayed = this.memory.playedCards.filter(c => c.suit === item.suit && c.rank === 'A').length;
                     const kPlayed = this.memory.playedCards.filter(c => c.suit === item.suit && c.rank === 'K').length;
                     // A/K出得越多，Q越安全
                     if (aPlayed >= 2 && kPlayed >= 2) adjustedProb = 1.0; // 确定性出
-                    else if (aPlayed >= 1 || kPlayed >= 1) adjustedProb = Math.min(prob + 0.15, 0.95);
+                    else if (aPlayed >= 1 || kPlayed >= 1) adjustedProb = Math.min(adjustedProb + 0.15, 0.95);
                 }
                 if (item.rank === 'J') {
                     const aPlayed = this.memory.playedCards.filter(c => c.suit === item.suit && c.rank === 'A').length;
                     const kPlayed = this.memory.playedCards.filter(c => c.suit === item.suit && c.rank === 'K').length;
                     const qPlayed = this.memory.playedCards.filter(c => c.suit === item.suit && c.rank === 'Q').length;
                     if (aPlayed >= 2 && kPlayed >= 2 && qPlayed >= 2) adjustedProb = 1.0;
-                    else if (aPlayed + kPlayed + qPlayed >= 3) adjustedProb = Math.min(prob + 0.15, 0.9);
+                    else if (aPlayed + kPlayed + qPlayed >= 3) adjustedProb = Math.min(adjustedProb + 0.15, 0.9);
                 }
 
                 if (Math.random() < adjustedProb) {
@@ -1769,7 +2088,6 @@ class TractorAI {
         // 第三轮：推断性出牌——之前出过大对子测试过，对手没跟对子
         // 说明对手可能没对子了，小对子也是大的
         for (const item of allPairs) {
-            if (item.oppVoid) continue;
             // 跳过已经处理过的大牌对子
             if (['A', 'K', 'Q', 'J', '10'].includes(item.rank)) continue;
 
@@ -1787,19 +2105,13 @@ class TractorAI {
     /**
      * 判断之前是否出过某花色的大对子（A对/K对/Q对），
      * 且对手跟牌时没出对子（说明对手可能没对子了）
+     *
+     * 改进：使用bigPairsLedBySuit追踪实际出过的大对子（而非简单计数2张同rank牌）
      */
     _hasTestedBigPairInSuit(suit, trumpSuit, level) {
-        // 检查记忆中是否有该花色的大对子出过
-        // playedCards是平铺的，需要按轮次分析
-        // 简化判断：如果该花色的A/K/Q出过2张以上，说明可能出过对子
-        const bigRanks = ['A', 'K', 'Q'];
-        for (const rank of bigRanks) {
-            const played = this.memory.playedCards.filter(c =>
-                c.suit === suit && c.rank === rank && !isTrump(c, trumpSuit, level)
-            );
-            if (played.length >= 2) {
-                return true;
-            }
+        // 优先使用精确追踪：bigPairsLedBySuit记录了首家实际出了大对子的花色
+        if (this.memory.bigPairsLedBySuit && this.memory.bigPairsLedBySuit.has(suit)) {
+            return true;
         }
         return false;
     }
@@ -1901,22 +2213,22 @@ class TractorAI {
         // === 收集所有强势出牌选项 ===
         const plays = [];
         
-        // 3a. 强势单张（≥85分）
+        // 3a. 强势单张（二值逻辑：100=绝对大牌，0=非绝对大牌）
         for (const suit of Object.keys(suitGroups)) {
             for (const card of suitGroups[suit]) {
-                const s = this._evaluateSingleStrength(card, trumpSuit, level);
-                if (s >= 85) {
+                const s = this._evaluateSingleStrength(card, trumpSuit, level, hand);
+                if (s >= 100) {
                     plays.push({ cards: [card], strength: s, type: 'single', suit, suitLen: suitGroups[suit].length });
                 }
             }
         }
-        
-        // 3b. 强势对子（≥70分）
+
+        // 3b. 强势对子（梯度评估：100=绝对大牌，≥60=概率强势）
         for (const suit of Object.keys(suitGroups)) {
             const pairs = this._findPairs(suitGroups[suit], trumpSuit, level);
             for (const pair of pairs) {
-                const s = this._evaluatePairStrength(pair, trumpSuit, level);
-                if (s >= 70) {
+                const s = this._evaluatePairStrength(pair, trumpSuit, level, hand);
+                if (s >= 60) {
                     plays.push({ cards: pair, strength: s, type: 'pair', suit, suitLen: suitGroups[suit].length });
                 }
             }
@@ -2307,15 +2619,33 @@ class TractorAI {
                 if (leadIsSmallTrump) {
                     const leadCount = this.memory.teammateSmallTrumpLeads;
 
-                    // ★ 第一次出小主牌：用大小王等级强牌抢出牌权
-                    // AI文档："若首家第一次出小单主牌，需用大小王等级的强牌努力争取出牌权。争不过那没办法。"
+                    // ★ 第一次出小主牌：三家直接掏王抢出牌权（战略性）
+                    // 用户策略："庄家第一次走小主牌单张 = 需要队友掏出王
+                    //   有大王走大王，没大王走小王，来争夺出牌权"
+                    // 拿到出牌权后走上几轮强势牌让庄家跑分或垫牌造成断门。
+                    // 没抢到出牌权 → 对手出A出对K，庄家手里分数牌全被逼走丢分。
                     if (leadCount <= 1) {
+                        // 有大王 → 走大王（绝对抢权，四家无法反超）
+                        const bigJoker = trumps.find(c =>
+                            c.isJoker && c.rank === 'big' &&
+                            getCardValue(c, trumpSuit, level) > winnerValue);
+                        if (bigJoker) {
+                            this._debug(`三家：队友首次出小主牌，掏大王抢出牌权`);
+                            return [bigJoker];
+                        }
+                        // 没大王有小王 → 走小王
+                        const smallJoker = trumps.find(c =>
+                            c.isJoker && c.rank === 'small' &&
+                            getCardValue(c, trumpSuit, level) > winnerValue);
+                        if (smallJoker) {
+                            this._debug(`三家：队友首次出小主牌，掏小王抢出牌权`);
+                            return [smallJoker];
+                        }
+                        // 没有王 → 尝试用级牌等强牌抢权（争不过那没办法）
                         const grabCard = this._grabControlCard(trumps, winnerValue, trumpSuit, level, isLastTrick, hand);
                         if (grabCard) {
-                            const label = grabCard.isJoker
-                                ? (grabCard.rank === 'big' ? '大王' : '小王')
-                                : (grabCard.rank === level ? '级牌' : '大主牌');
-                            this._debug(`三家：队友首次出小主牌，用${label}抢出牌权`);
+                            const label = grabCard.rank === level ? '级牌' : '大主牌';
+                            this._debug(`三家：队友首次出小主牌，无王，用${label}抢权`);
                             return [grabCard];
                         }
                         this._debug(`三家：队友首次出小主牌，争不过，跟最小主牌`);
@@ -2467,7 +2797,16 @@ class TractorAI {
             const matching = tractors.find(t => t.length >= needLen);
             if (matching) {
                 if (iAmWinning) return matching.slice(0, needLen);
-                // 对手赢，出最大拖拉机
+                // 对手赢，找最小的能赢过对手的拖拉机
+                const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+                const winnerValue = getCardValue(winner.cards[0], trumpSuit, level);
+                for (const tractor of tractors) {
+                    if (tractor.length < needLen) continue;
+                    if (getCardValue(tractor[0], trumpSuit, level) > winnerValue) {
+                        return tractor.slice(0, needLen);
+                    }
+                }
+                // 赢不了，出最小拖拉机
                 return matching.slice(0, needLen);
             }
             // 没有拖拉机，优先出对子
@@ -2606,7 +2945,7 @@ class TractorAI {
             // 判断队友出的是大单副牌还是小单
             const leadCard = trickCards[0].cards[0];
             const leadValue = getCardValue(leadCard, trumpSuit, level);
-            const teammatePlayedBig = leadValue >= 11; // A=11
+            const teammatePlayedBig = leadValue >= 12; // A=12（RANKS下标），K=11
 
             // 判断二家是否毙杀（二家是position 2，trickCards[1]）
             const secondPlayerCards = trickCards.length >= 2 ? trickCards[1].cards : [];
@@ -2614,14 +2953,14 @@ class TractorAI {
                 secondPlayerCards.some(c => isTrump(c, trumpSuit, level));
             const secondCard = secondPlayerCards.length > 0 ? secondPlayerCards[0] : null;
             const secondCardValue = secondCard ? getCardValue(secondCard, trumpSuit, level) : 0;
-            const secondPlayedBig = secondCardValue >= 11; // 二家跟了大牌（A）
+            const secondPlayedBig = secondCardValue >= 12; // 二家跟了大牌（A=12）
 
             // --- 队友首发大单副牌 ---
             if (teammatePlayedBig) {
                 if (!secondKilled) {
                     // 二家未毙杀 → 判断四家断门毙杀的可能性再决定是否加分
                     // 强化判断：四家该花色走牌≤3张时，基本不太会断门
-                    const fourthPlayedCount = this._countSuitPlayedByPlayer(leadSuit, 4);
+                    const fourthPlayedCount = this._countSuitPlayedByPlayer(leadSuit, 4, leadPlayer);
                     const fourthLikelyVoid = fourthPlayedCount > 3; // 走牌>3张才有可能断门
 
                     if (fourthLikelyVoid) {
@@ -2714,9 +3053,10 @@ class TractorAI {
 
         // ================================================================
         // 通用策略（position 2/4 或首家非队友）
+        // 注意：拦截是三家专属策略，二家和四家不存在拦截概念
         // ================================================================
         if (iAmWinning) {
-            const teammatePlayedBig = winnerValue >= 11; // A=11
+            const teammatePlayedBig = winnerValue >= 12; // A=12（RANKS下标），K=11
 
             if (isLastPlayer) {
                 const runCard = this._getRunScoreCard(leadSuitCards);
@@ -2730,12 +3070,7 @@ class TractorAI {
                 return [leadSuitCards[0]];
             }
 
-            // 队友出小牌赢，非最后一家 → 拦截
-            if (this._shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, leadSuit)) {
-                const interceptCard = this._findInterceptCard(leadSuitCards, trumpSuit, level);
-                if (interceptCard) return [interceptCard];
-            }
-
+            // 队友出小牌赢，非最后一家 → 跟最小非分牌（二家/四家不拦截）
             const nonPoint = leadSuitCards.filter(c => !this._isPointCard(c));
             if (nonPoint.length > 0) return [this._pickRandom(nonPoint.slice(0, Math.min(2, nonPoint.length)))];
             const discardCard = this._getDiscardScoreCard(leadSuitCards);
@@ -2746,7 +3081,8 @@ class TractorAI {
         const winnerIsTrump = isTrump(winnerCard, trumpSuit, level);
         if (!winnerIsTrump) {
             const winnerValue2 = getCardValue(winnerCard, trumpSuit, level);
-            for (let i = leadSuitCards.length - 1; i >= 0; i--) {
+            // 出最小的能赢过对手的牌（节省大牌）
+            for (let i = 0; i < leadSuitCards.length; i++) {
                 if (getCardValue(leadSuitCards[i], trumpSuit, level) > winnerValue2) {
                     return [leadSuitCards[i]];
                 }
@@ -2786,7 +3122,7 @@ class TractorAI {
 
             const leadCard = trickCards[0].cards[0];
             const leadValue = getCardValue(leadCard, trumpSuit, level);
-            const teammatePlayedBig = leadValue >= 11; // A对
+            const teammatePlayedBig = leadValue >= 12; // A对（A=12，K=11）
 
             // 判断二家是否毙杀
             const secondPlayerCards = trickCards.length >= 2 ? trickCards[1].cards : [];
@@ -3780,28 +4116,37 @@ class TractorAI {
      */
     _killWithTrump(trumps, leadPattern, trickCards, trumpSuit, level, needLen) {
         if (leadPattern.type === 'single') {
+            const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
+            const winnerCard = winner.cards[0];
+            const winnerIsTrump = isTrump(winnerCard, trumpSuit, level);
+            const winnerValue = getCardValue(winnerCard, trumpSuit, level);
+
             // 优先用主牌分牌杀（♠5、♠10、♠K等主花色分牌）
             const trumpPointCards = trumps.filter(c => this._isPointCard(c));
             if (trumpPointCards.length > 0) {
-                // 找最小的能赢的主牌分牌
-                const winner = getTrickWinner(trickCards, trumpSuit, level, this.memory.playedCards);
-                const winnerCard = winner.cards[0];
-                const winnerIsTrump = isTrump(winnerCard, trumpSuit, level);
-
                 if (!winnerIsTrump) {
                     // 对手是副牌，任何主牌都能赢，用最小的主牌分牌
                     return [trumpPointCards[0]];
                 }
                 // 对手是主牌，找最小的能赢的主牌分牌
-                const winnerValue = getCardValue(winnerCard, trumpSuit, level);
                 for (const card of trumpPointCards) {
                     if (getCardValue(card, trumpSuit, level) > winnerValue) {
                         return [card];
                     }
                 }
             }
-            // 没有主牌分牌，用最小的能赢的主牌
-            return [this._findMinWinningTrump(trumps, trickCards, trumpSuit, level, leadPattern)];
+            // 没有主牌分牌或分牌赢不了，用最小的能赢的主牌
+            if (!winnerIsTrump) {
+                // 对手是副牌，任何主牌都能赢
+                return [trumps[0]];
+            }
+            for (const trump of trumps) {
+                if (getCardValue(trump, trumpSuit, level) > winnerValue) {
+                    return [trump];
+                }
+            }
+            // 没有任何主牌能赢过对手 → 返回null（调用方回退到垫牌）
+            return null;
         }
 
         if (leadPattern.type === 'pair') {

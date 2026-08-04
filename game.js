@@ -1494,7 +1494,10 @@ class GameState {
         
         const dealerScore = this.trickScores[dealerTeam];
         const attackerScore = this.trickScores[attackerTeam];
-        
+
+        // 记录本轮实际打牌的级别（升级前），用于全局胜利判定
+        const playedLevel = this.teamLevels[dealerTeam];
+
         let result = {
             dealerTeam: dealerTeam,
             attackerTeam: attackerTeam,
@@ -1506,7 +1509,8 @@ class GameState {
             attackerWonLastTrick: attackerWon,
             upgrade: 0,
             newDealer: null,
-            winner: null
+            winner: null,
+            playedLevel: playedLevel
         };
         
         if (attackerScore >= 80) {
@@ -1547,12 +1551,14 @@ class GameState {
     
     checkGameOver(lastRoundResult) {
         // A必打规则：打A时须做庄守擂成功一次才算全局获胜
-        // 只有庄家方在A级别且刚刚守擂成功（闲家得分<80），才算获胜
+        // 关键：必须用本轮实际打的级别（升级前）判定，而非升级后的级别
+        // 否则从K升级到A时会误判为"已在A守擂成功"
         if (lastRoundResult && lastRoundResult.winner) {
             const winnerTeam = lastRoundResult.winner;
             // 检查赢方是否是守擂成功的庄家方（非闲家上台）
             const dealerWon = lastRoundResult.attackerScore < 80;
-            if (dealerWon && this.teamLevels[winnerTeam] === 'A') {
+            const playedLevel = lastRoundResult.playedLevel;
+            if (dealerWon && playedLevel === 'A') {
                 return winnerTeam;
             }
         }

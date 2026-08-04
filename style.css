@@ -755,6 +755,30 @@ body {
     animation: dealCard 0.4s ease-out;
 }
 
+/* 发牌阶段可叫主牌高亮 */
+.card.bid-highlight {
+    position: relative;
+    box-shadow: 0 0 12px 3px rgba(255, 215, 0, 0.7), 0 0 6px rgba(255, 215, 0, 0.5);
+    cursor: pointer;
+    animation: bidGlow 1.5s ease-in-out infinite;
+    z-index: 10;
+}
+
+.card.bid-highlight:hover {
+    box-shadow: 0 0 18px 6px rgba(255, 215, 0, 0.9), 0 0 8px rgba(255, 215, 0, 0.7);
+    transform: translateY(-8px);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+@keyframes bidGlow {
+    0%, 100% {
+        box-shadow: 0 0 8px 2px rgba(255, 215, 0, 0.5), 0 0 4px rgba(255, 215, 0, 0.3);
+    }
+    50% {
+        box-shadow: 0 0 14px 4px rgba(255, 215, 0, 0.8), 0 0 6px rgba(255, 215, 0, 0.5);
+    }
+}
+
 /* 叫主暂停提示 */
 .bid-pause-notice {
     position: fixed;

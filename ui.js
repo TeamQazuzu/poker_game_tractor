@@ -14,6 +14,10 @@ let skippedSingleBidSuits = new Set(); // 玩家已放弃的单张叫主花色
 let hasSkippedCounterBid = false;      // 玩家是否已放弃过反主
 let currentBidOptions = null;          // 当前弹窗的叫主选项
 
+// 新叫主系统：发牌阶段高亮可叫主牌
+let hasHadFirstBidPause = false;       // 是否已用过第一局首张级牌5秒暂停
+let isDealingPhase = false;            // 是否处于发牌阶段（用于高亮可叫主牌）
+
 // DOM元素引用
 const elements = {};
 
@@ -204,10 +208,30 @@ function renderHand() {
         mandatoryIds = getMandatoryCardIds(hand, game.currentTrick, game.trumpSuit, game.level);
     }
 
+    // 发牌阶段：计算可叫主的牌ID集合
+    let bidCardIds = new Set();
+    if (isDealingPhase) {
+        const availableBids = getAvailableBids(hand, game.level, game.bidState.currentBid);
+        for (const bid of availableBids) {
+            for (const c of bid.cards) {
+                bidCardIds.add(c.id);
+            }
+        }
+    }
+
     for (let i = 0; i < hand.length; i++) {
         const card = hand[i];
         const isMandatory = mandatoryIds.includes(card.id);
-        const cardEl = createCardElement(card, isHumanTurn, onCardClick, isMandatory);
+        const isBidCard = bidCardIds.has(card.id);
+        
+        let cardEl;
+        if (isBidCard) {
+            // 可叫主的牌：高亮+可点击
+            cardEl = createCardElement(card, true, onBidCardClick, false);
+            cardEl.classList.add('bid-highlight');
+        } else {
+            cardEl = createCardElement(card, isHumanTurn, onCardClick, isMandatory);
+        }
 
         // 检查是否已选中
         if (selectedCards.some(c => c.id === card.id)) {
@@ -257,6 +281,55 @@ function onCardClick(card, cardEl) {
     selectedCards.push(card);
     cardEl.classList.add('selected');
     updateActionButtons();
+}
+
+/**
+ * 发牌阶段：点击高亮可叫主牌执行叫主/反主
+ * 根据点击的牌自动匹配最强势的可用叫主选项
+ */
+function onBidCardClick(card, cardEl) {
+    if (!isDealingPhase) return;
+
+    const hand = game.players.bottom;
+    const availableBids = getAvailableBids(hand, game.level, game.bidState.currentBid);
+    if (availableBids.length === 0) return;
+
+    // 找到包含这张牌的所有叫主选项，选power最高的
+    const matchingBids = availableBids.filter(bid => bid.cards.some(c => c.id === card.id));
+    if (matchingBids.length === 0) return;
+
+    matchingBids.sort((a, b) => b.power - a.power);
+    const bid = matchingBids[0];
+
+    // 如果已有弹窗（第一局5秒暂停），通过弹窗按钮处理
+    const existingNotice = document.getElementById('bid-pause-notice');
+    if (existingNotice) return;
+
+    // 执行叫主/反主
+    const success = game.makeBid('bottom', bid);
+    if (!success) return;
+
+    currentBid = game.bidState.currentBid;
+    bidPlayer = 'bottom';
+
+    const trumpDisplay = bid.suit ? SUIT_SYMBOLS[bid.suit] : '无主';
+    const bidTypeNames = {
+        [BID_TYPES.SINGLE]: '叫主',
+        [BID_TYPES.PAIR_LEVEL]: '反主',
+        [BID_TYPES.PAIR_SMALL_JOKER]: '反主',
+        [BID_TYPES.PAIR_BIG_JOKER]: '反主'
+    };
+    log(`✅ 你 ${bidTypeNames[bid.type]} ${bid.display} → 主: ${trumpDisplay}`);
+
+    if (game.dealer === 'bottom' && !game.bidState.dealerConfirmed) {
+        log(`🏦 你 成为庄家`);
+    }
+
+    updateInfo();
+    for (const pos of PLAYERS) {
+        game.sortHand(pos);
+    }
+    renderHand();
 }
 
 // 更新操作按钮
@@ -371,6 +444,7 @@ function startRound() {
     hasSkippedCounterBid = false;
     currentBidOptions = null;
     game.trumpSuit = null;
+    isDealingPhase = true; // 进入发牌阶段，高亮可叫主牌
     
     log(`开始发牌，当前打 ${game.level}${isFirstRound ? '（首轮抢庄）' : `，庄家: ${game.dealer === 'bottom' ? '你' : game.dealer === 'left' ? 'AI-左' : game.dealer === 'top' ? 'AI-上' : 'AI-右'}`}`);
     updateInfo();
@@ -431,14 +505,19 @@ function dealNextCardAnimated() {
         
         if (availableBids.length > 0) {
             if (result.player === 'bottom') {
-                // 玩家：检查是否应该暂停发牌给叫主机会
-                const shouldPause = checkShouldPauseForBid(availableBids);
-                if (shouldPause) {
+                // 玩家：仅第一局首张级牌给5秒暂停（抢庄机会），之后不暂停
+                // 所有可叫主牌已高亮可点击，玩家随时可点击叫主/反主
+                const isFirstRound = game.dealer === null;
+                const hasSingleBid = availableBids.some(b => b.type === BID_TYPES.SINGLE);
+                
+                if (isFirstRound && !hasHadFirstBidPause && hasSingleBid) {
+                    // 第一局首张级牌：5秒暂停
+                    hasHadFirstBidPause = true;
                     if (dealTimer) { clearTimeout(dealTimer); dealTimer = null; }
                     showBidPauseNotice(availableBids);
                     return;
                 }
-                // 不暂停，继续发牌（AI仍可能叫主）
+                // 其余情况：不暂停，继续发牌（玩家可通过点击高亮牌叫主）
             } else {
                 // AI：自动决定是否叫主/反主（不暂停动画）
                 const ai = aiPlayers[result.player];
@@ -447,22 +526,14 @@ function dealNextCardAnimated() {
                 );
                 if (bidDecision) {
                     handleAiBid(result.player, bidDecision);
-                    
-                    // AI叫主后，检查玩家是否能反主，如能则暂停5秒
-                    const playerHand = game.players.bottom;
-                    const playerCounterBids = getAvailableBids(playerHand, game.level, game.bidState.currentBid);
-                    if (playerCounterBids.length > 0) {
-                        // 先清除可能存在的发牌计时器
-                        if (dealTimer) { clearTimeout(dealTimer); dealTimer = null; }
-                        showBidPauseNotice(playerCounterBids);
-                        return;
-                    }
+                    // AI叫主后不再暂停给玩家5秒，玩家可通过点击高亮牌反主
+                    // 发牌结束后还有3秒最终反主机会
                 }
             }
         }
     }
     
-    // 0.3秒后发下一张
+    // 0.1秒后发下一张
     dealTimer = setTimeout(() => dealNextCardAnimated(), 100);
 }
 
@@ -690,12 +761,13 @@ function afterDealingComplete() {
     for (const pos of PLAYERS) {
         game.sortHand(pos);
     }
+    isDealingPhase = false; // 发牌阶段结束，不再高亮可叫主牌
     renderHand();
     updateInfo();
     log('发牌完成');
     
     if (game.bidState.currentBid) {
-        // 发牌中已有人叫主，给玩家5秒最终反主机会
+        // 发牌中已有人叫主，给玩家3秒最终反主机会（有能力才给）
         finalCounterBidPhase();
     } else {
         // 无人叫主，AI快速叫主
@@ -705,7 +777,7 @@ function afterDealingComplete() {
 
 /**
  * 发牌完毕后的最终反主阶段
- * 玩家有5秒反主机会，同时AI也检查是否能反主
+ * 玩家有3秒反主机会（有能力才给），同时AI也检查是否能反主
  */
 function finalCounterBidPhase() {
     const names = { left: 'AI-左', top: 'AI-上', right: 'AI-右' };
@@ -739,11 +811,11 @@ function finalCounterBidPhase() {
     const availableBids = getAvailableBids(playerHand, game.level, game.bidState.currentBid);
     
     if (availableBids.length > 0) {
-        // 玩家可以反主，给5秒
-        log('你最终反主机会（5秒）');
+        // 玩家可以反主，给3秒
+        log('你最终反主机会（3秒）');
         showFinalCounterNotice(availableBids);
     } else {
-        // 玩家无法反主，直接进入埋底
+        // 玩家无法反主，直接进入埋底（跳过3秒）
         const trumpDisplay = game.trumpSuit ? SUIT_SYMBOLS[game.trumpSuit] : '无主';
         log(`主花色确定: ${trumpDisplay}`);
         setTimeout(() => startBurying(), 800);
@@ -762,8 +834,16 @@ function showFinalCounterNotice(availableBids) {
     
     // 读取当前叫主状态（使用局部别名，不遮蔽全局 currentBid）
     const cb = game.bidState.currentBid;
-    const bidderName = cb.player === 'bottom' ? '你' : (names[cb.player] || cb.player);
-    const trumpDisplay = cb.suit ? SUIT_SYMBOLS[cb.suit] : '无主';
+    const isCounter = !!cb; // 有当前叫主则为反主，否则为叫主
+    
+    let currentBidInfo = '';
+    if (isCounter) {
+        const bidderName = cb.player === 'bottom' ? '你' : (names[cb.player] || cb.player);
+        const trumpDisplay = cb.suit ? SUIT_SYMBOLS[cb.suit] : '无主';
+        currentBidInfo = `<div class="notice-card-info">当前: ${bidderName} ${cb.display || ''} → ${trumpDisplay}</div>`;
+    }
+    
+    const actionLabel = isCounter ? '反主' : '叫主';
     
     let bidButtonsHTML = '';
     for (const bid of availableBids) {
@@ -776,24 +856,24 @@ function showFinalCounterNotice(availableBids) {
         bidButtonsHTML += `
             <button class="bid-flip-btn ${colorClass}" data-bid-idx="${availableBids.indexOf(bid)}">
                 ${bid.display}
-                <span class="flip-desc">反主</span>
+                <span class="flip-desc">${actionLabel}</span>
             </button>
         `;
     }
     
     notice.innerHTML = `
-        <div class="notice-title">最终反主机会</div>
-        <div class="notice-card-info">当前: ${bidderName} ${cb.display || ''} → ${trumpDisplay}</div>
-        <div class="notice-countdown" id="bid-countdown">5</div>
-        <div class="notice-hint">点击反主，或等待5秒后确认</div>
-        <div class="bid-section-title">可反主选项</div>
+        <div class="notice-title">最终${actionLabel}机会</div>
+        ${currentBidInfo}
+        <div class="notice-countdown" id="bid-countdown">3</div>
+        <div class="notice-hint">点击${actionLabel}，或等待3秒后确认</div>
+        <div class="bid-section-title">可${actionLabel}选项</div>
         <div class="bid-buttons" id="bid-flip-buttons">${bidButtonsHTML}</div>
-        <button class="bid-pass-btn" id="bid-pass-btn">不反主</button>
+        <button class="bid-pass-btn" id="bid-pass-btn">不${actionLabel}</button>
     `;
     
     document.body.appendChild(notice);
     
-    let countdown = 5;
+    let countdown = 3;
     const countdownEl = document.getElementById('bid-countdown');
     const countdownTimer = setInterval(() => {
         countdown--;
@@ -825,7 +905,8 @@ function showFinalCounterNotice(availableBids) {
             }
 
             const trumpDisplay = bid.suit ? SUIT_SYMBOLS[bid.suit] : '无主';
-            log(`✅ 你 反主 ${bid.display} → 主: ${trumpDisplay}`);
+            const bidTypeName = isCounter ? '反主' : '叫主';
+            log(`✅ 你 ${bidTypeName} ${bid.display} → 主: ${trumpDisplay}`);
             currentBid = game.bidState.currentBid;
             bidPlayer = 'bottom';
 
@@ -902,7 +983,7 @@ function finalAiBidPhase() {
     const playerHand = game.players.bottom;
     const availableBids = getAvailableBids(playerHand, game.level, null);
     if (availableBids.length > 0) {
-        log('无人叫主，你的叫主机会（5秒）');
+        log('无人叫主，你的叫主机会（3秒）');
         showFinalCounterNotice(availableBids);
         return;
     }
