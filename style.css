@@ -54,6 +54,26 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.2);
 }
 
+/* 全屏按钮 */
+.btn-fullscreen {
+    padding: 4px 14px;
+    border-radius: 15px;
+    border: 1px solid rgba(255, 215, 0, 0.5);
+    background: rgba(255, 215, 0, 0.15);
+    color: #ffd700;
+    font-size: 13px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+    white-space: nowrap;
+}
+
+.btn-fullscreen:hover {
+    background: rgba(255, 215, 0, 0.3);
+    border-color: #ffd700;
+}
+
 .score-board {
     display: flex;
     align-items: center;
@@ -391,6 +411,11 @@ body {
     align-items: center;
     line-height: 1;
     transform: rotate(180deg);
+}
+
+/* 出牌区域：隐藏角标小花色，只保留中间大花色 */
+.card-playing .card-suit-corner {
+    display: none;
 }
 
 /* 红色牌 */
@@ -1046,6 +1071,12 @@ body {
 
     .game-info span {
         padding: 2px 8px;
+        border-radius: 10px;
+    }
+
+    .btn-fullscreen {
+        padding: 2px 8px;
+        font-size: 10px;
         border-radius: 10px;
     }
 

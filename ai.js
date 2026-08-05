@@ -54,8 +54,8 @@ class TractorAI {
             },
             trickCount: 0,       // 轮次计数（用于判断开局阶段）
             failedThrows: [],    // 记录甩错的牌型（避免AI重复甩错）
-            teammateSmallTrumpLeads: 0,  // 队友首发出小主牌的次数
-            lastSmallTrumpLeadTrick: -1, // 上次记录小主牌首发的轮次（防重复计数）
+            dealerTeammateHasLed: false,  // 庄家的队友是否拿到过出牌权（赢得过一轮）
+            pendingTractorLead: false,    // 二家大王抢权后，下轮强制走副牌拖拉机
             bottomPoints: null,  // 底牌分数（庄家AI埋底后记录，用于判断是否需要保底策略）
             dealer: null,        // 当前庄家位置（由decidePlay同步）
             bigPairsLedBySuit: new Set() // 记录出过大对子（A/K/Q对）的花色
@@ -82,6 +82,39 @@ class TractorAI {
     _isTeammate(player) {
         if (player === this.position) return false;
         return TEAMS.TEAM_A.includes(player) === this._isMyTeam();
+    }
+
+    /**
+     * 获取庄家的队友位置
+     * 庄家的队友 = 与庄家同队的另一名玩家
+     * @param {string} dealer - 庄家位置
+     * @returns {string|null}
+     */
+    _getDealerTeammate(dealer) {
+        if (!dealer) return null;
+        const dealerTeam = TEAMS.TEAM_A.includes(dealer) ? TEAMS.TEAM_A : TEAMS.TEAM_B;
+        return dealerTeam.find(p => p !== dealer);
+    }
+
+    /**
+     * 判断庄家是否在某花色出过非主牌（=没断门该花色）
+     *
+     * 用户策略：走A时优先走庄家确定没断门的花色（出过该花色牌），
+     *   避免走没走过的花色（庄家可能断门毙杀）。
+     *   庄家多拿8张底牌，断门能力强，是主要毙杀威胁。
+     *
+     * @param {string} dealer - 庄家位置
+     * @param {string} suit - 花色
+     * @param {string} trumpSuit - 主花色
+     * @param {string} level - 级别
+     * @returns {boolean} true=庄家出过该花色（没断门），false=没出过（可能断门）
+     */
+    _dealerPlayedSuit(dealer, suit, trumpSuit, level) {
+        if (!dealer) return false;
+        const dealerCards = this.memory.playerCards[dealer] || [];
+        return dealerCards.some(c =>
+            !c.isJoker && c.suit === suit && !isTrump(c, trumpSuit, level)
+        );
     }
 
     // ================================================================
@@ -258,20 +291,17 @@ class TractorAI {
      * 判断是否应该进行拦截
      *
      * 【拦截介入时机规则】
-     * 拦截规则的介入时机以"庄家(队友)第一次走单张小主牌"为标志。
-     * 庄家第一次出小主牌后，被队友接手或被对手抢走出牌权——这一轮之后，
-     * 拦截规则才开始介入。庄家第一次走小主牌的这一轮本身不拦截，而是
-     * 用尽全力抢出牌权（因为第一次出牌权最重要，A和强势副牌=分数）。
-     *
-     * 因此：在尚未发生过"庄家第一次走小主牌后被抢权"的事件时
-     * （即 memory.teammateSmallTrumpLeads < 1），处于第一次出牌权争夺阶段，
-     * 此时应用尽全力抢出牌权，不做拦截，直接返回 false。
+     * 拦截的介入时机以"庄家的队友是否拿到过出牌权"为判据：
+     *   - 庄家队友从未拿到出牌权 → 对手方每次都竭尽全力争抢出牌权，不拦截
+     *     （因为庄家队友手里还有强势牌没走，拿到出牌权意义重大）
+     *   - 庄家队友已拿到过出牌权 → 拦截策略即可
+     *     （强势牌基本打光，再花大代价抢出牌权意义不大）
      *
      * 拦截场景（介入后）：中盘，庄家走小牌单张，下家小跟，无分。
      * 此时队友AI要用一张中级牌保证最后一家不轻松跑分。
      *
      * 条件：
-     *   0. 已过第一次出牌权争夺阶段（teammateSmallTrumpLeads >= 1）
+     *   0. 庄家队友已拿到过出牌权（dealerTeammateHasLed === true）
      *   1. 中盘阶段（手牌7~17张）
      *   2. 桌上无分（trickScore === 0）
      *   3. 非最后一家（后面还有玩家可能跑分）
@@ -280,10 +310,8 @@ class TractorAI {
      * @returns {boolean}
      */
     _shouldIntercept(hand, trickCards, trickScore, trumpSuit, level, leadSuit) {
-        // 【第一次出牌权争夺阶段不拦截】
-        // 庄家(队友)第一次走小主牌前/这一轮，应用尽全力抢出牌权，不拦截。
-        // 参考 memory.teammateSmallTrumpLeads：尚未发生首次小主牌首发被抢权事件时，不拦截。
-        if (!this.memory.teammateSmallTrumpLeads || this.memory.teammateSmallTrumpLeads < 1) {
+        // 庄家队友尚未拿到出牌权 → 争抢阶段，不拦截
+        if (!this.memory.dealerTeammateHasLed) {
             return false;
         }
 
@@ -1409,6 +1437,14 @@ class TractorAI {
 
     _leadPlay(hand, trumpSuit, level, isDealerTeam, dealer) {
         this.memory.trickCount++; // 新的一轮开始
+
+        // 追踪庄家的队友是否拿到过出牌权
+        // 若我是庄家的队友且正在首发，说明我已赢得上一轮、拿到出牌权
+        const dealerTeammate = this._getDealerTeammate(dealer);
+        if (dealerTeammate && this.position === dealerTeammate) {
+            this.memory.dealerTeammateHasLed = true;
+        }
+
         const trumps = this._sortByValue(hand.filter(c => isTrump(c, trumpSuit, level)), trumpSuit, level);
         const nonTrumps = this._sortByValue(hand.filter(c => !isTrump(c, trumpSuit, level)), trumpSuit, level);
 
@@ -1418,6 +1454,20 @@ class TractorAI {
             suitGroups[suit] = this._sortByValue(
                 nonTrumps.filter(c => c.suit === suit), trumpSuit, level
             );
+        }
+
+        // === 二家大王抢权后的强制走拖拉机（优先级最高）===
+        // 用户策略：抢权后直接走副牌拖拉机，不走副牌A（怕被庄家断门毙杀拿走出牌权）
+        // 常规首发应先走数量少的绝对大牌（A）再走拖拉机，但抢权后是例外
+        // 放在尾盘策略之前：既然已花大王抢权，就必须执行拖拉机策略
+        if (this.memory.pendingTractorLead) {
+            this.memory.pendingTractorLead = false; // 消费标志
+            const tractor = this._findSideTractor(hand, trumpSuit, level);
+            if (tractor) {
+                this._debug(`首发：执行抢权后拖拉机策略`);
+                return tractor;
+            }
+            // 拖拉机已不存在（可能中间被消耗），降级常规首发
         }
 
         // === 尾盘策略：最后一轮/倒数第二轮的出牌权争夺 ===
@@ -1431,7 +1481,7 @@ class TractorAI {
         if (isDealerTeam) {
             return this._leadAsDealer(trumps, suitGroups, trumpSuit, level, hand, dealer);
         } else {
-            return this._leadAsAttacker(trumps, suitGroups, trumpSuit, level, hand);
+            return this._leadAsAttacker(trumps, suitGroups, trumpSuit, level, hand, dealer);
         }
     }
 
@@ -1987,9 +2037,9 @@ class TractorAI {
      * 3. 对手已断门的花色不出大牌（会被杀）
      * 4. 没有大牌可出时，出最长套小牌消耗对手主牌
      */
-    _leadAsAttacker(trumps, suitGroups, trumpSuit, level, hand) {
-        // 使用统一的强势牌评估系统（传入null作为dealer，因为attacker不是庄家队）
-        return this._leadWithStrength(trumps, suitGroups, trumpSuit, level, hand, null);
+    _leadAsAttacker(trumps, suitGroups, trumpSuit, level, hand, dealer) {
+        // 使用统一的强势牌评估系统（传入dealer，用于判断庄家断门风险）
+        return this._leadWithStrength(trumps, suitGroups, trumpSuit, level, hand, dealer);
     }
 
     /**
@@ -2260,7 +2310,15 @@ class TractorAI {
                 if (order[a.type] !== order[b.type]) return order[b.type] - order[a.type];
                 // 同类型比强势度
                 if (b.strength !== a.strength) return b.strength - a.strength;
-                // 同强势度：短套优先（先处理危险花色，避免断门后被杀）
+                // 同强势度：优先走庄家确定没断门的花色（出过该花色非主牌）
+                // 用户策略：庄家出过某花色=没断门=走A很稳；
+                //   没出过的花色=可能断门=有被毙杀风险（庄家多拿8张底牌，断门能力强）
+                if (dealer) {
+                    const aSafe = this._dealerPlayedSuit(dealer, a.suit, trumpSuit, level);
+                    const bSafe = this._dealerPlayedSuit(dealer, b.suit, trumpSuit, level);
+                    if (aSafe !== bSafe) return aSafe ? -1 : 1; // 安全的优先
+                }
+                // 再按短套优先（处理自己的危险花色，避免自己被动断门）
                 return a.suitLen - b.suitLen;
             });
             return plays[0].cards;
@@ -2449,13 +2507,14 @@ class TractorAI {
         const leadSuit = getLeadSuit(leadCards, trumpSuit, level);
         const leadPlayer = trickCards[0].player;
 
-        // === 追踪队友首发出小主牌的次数 ===
-        // 用户策略："首家队友第一次出小单主牌→用大小王抢权；第二次开始→仅需拦截防跑分"
-        if (this._isTeammate(leadPlayer) && leadSuit === null &&
-            this._isSmallTrumpCard(leadCards, trumpSuit, level) &&
-            this.memory.lastSmallTrumpLeadTrick !== this.memory.trickCount) {
-            this.memory.teammateSmallTrumpLeads++;
-            this.memory.lastSmallTrumpLeadTrick = this.memory.trickCount;
+        // === 追踪庄家的队友是否拿到过出牌权 ===
+        // 当前轮首家 = 上一轮赢家。若首家是庄家队友，说明庄家队友已拿过出牌权。
+        // 这是"争权vs拦截"的关键判据：
+        //   未拿过出牌权 → 对手方竭尽全力阻止庄家队友上手（每次都争，不只第一次）
+        //   已拿过出牌权 → 拦截策略即可（强势牌基本打光，再争意义不大）
+        const dealerTeammate = this._getDealerTeammate(dealer);
+        if (dealerTeammate && leadPlayer === dealerTeammate) {
+            this.memory.dealerTeammateHasLed = true;
         }
 
         // 判断当前谁在赢
@@ -2597,8 +2656,28 @@ class TractorAI {
                 // 对手走小主牌 → 可以跟小主牌交给四家队友管理，或直接抢权
                 // 对手走大主牌 → 跟小主牌保留实力
                 if (leadIsSmallTrump) {
-                    // 对手走小主牌，自己可以跟非分小主牌交给队友
-                    // 也可以直接上大牌抢权（如果有A/级牌等强势主牌）
+                    // ★ 特殊情形：二家有大王 + 有副牌拖拉机 → 直接大王抢权
+                    // 用户策略：庄家首出小单主，二家通常跟小让三家四家争；
+                    //   但若二家有大王且手握副牌拖拉机，应直接大王抢权后下轮走拖拉机。
+                    //   一来逼出三家可能持有的A/对K（拖拉机难以被杀），
+                    //   二来队友（四家）可跑分或造成断门。
+                    //   不走副牌A，因为可能被庄家断门毙杀拿走出牌权，拖拉机就走不了。
+                    //   仅限非尾盘（早期几轮，大王不用于保底）。
+                    if (!this._isEndGame(hand)) {
+                        const bigJoker = trumps.find(c =>
+                            c.isJoker && c.rank === 'big' &&
+                            getCardValue(c, trumpSuit, level) > winnerValue);
+                        if (bigJoker) {
+                            const sideTractor = this._findSideTractor(hand, trumpSuit, level);
+                            if (sideTractor) {
+                                this.memory.pendingTractorLead = true;
+                                this._debug(`二家：有大王+副牌拖拉机，大王抢权下轮走拖拉机`);
+                                return [bigJoker];
+                            }
+                        }
+                    }
+
+                    // 常规：跟非分小主牌，让三家四家去争
                     const nonPointTrumps = trumps.filter(c => !this._isPointCard(c));
                     if (nonPointTrumps.length > 0) {
                         return [nonPointTrumps[0]]; // 跟最小非分主牌
@@ -2617,20 +2696,18 @@ class TractorAI {
                 // 首家是队友，关键区分：队友出的是小主牌 vs 大主牌 vs 王
 
                 if (leadIsSmallTrump) {
-                    const leadCount = this.memory.teammateSmallTrumpLeads;
-
-                    // ★ 第一次出小主牌：三家直接掏王抢出牌权（战略性）
+                    // ★ 庄家队友从未拿到出牌权 → 竭尽全力抢出牌权（即使用大王）
                     // 用户策略："庄家第一次走小主牌单张 = 需要队友掏出王
                     //   有大王走大王，没大王走小王，来争夺出牌权"
-                    // 拿到出牌权后走上几轮强势牌让庄家跑分或垫牌造成断门。
-                    // 没抢到出牌权 → 对手出A出对K，庄家手里分数牌全被逼走丢分。
-                    if (leadCount <= 1) {
+                    // 只要庄家队友还没拿到过出牌权，每次走小主牌都要全力争抢
+                    // （不只第一次，而是直到庄家队友真正拿到出牌权为止）
+                    if (!this.memory.dealerTeammateHasLed) {
                         // 有大王 → 走大王（绝对抢权，四家无法反超）
                         const bigJoker = trumps.find(c =>
                             c.isJoker && c.rank === 'big' &&
                             getCardValue(c, trumpSuit, level) > winnerValue);
                         if (bigJoker) {
-                            this._debug(`三家：队友首次出小主牌，掏大王抢出牌权`);
+                            this._debug(`三家：庄家队友未拿权，掏大王抢出牌权`);
                             return [bigJoker];
                         }
                         // 没大王有小王 → 走小王
@@ -2638,31 +2715,31 @@ class TractorAI {
                             c.isJoker && c.rank === 'small' &&
                             getCardValue(c, trumpSuit, level) > winnerValue);
                         if (smallJoker) {
-                            this._debug(`三家：队友首次出小主牌，掏小王抢出牌权`);
+                            this._debug(`三家：庄家队友未拿权，掏小王抢出牌权`);
                             return [smallJoker];
                         }
                         // 没有王 → 尝试用级牌等强牌抢权（争不过那没办法）
                         const grabCard = this._grabControlCard(trumps, winnerValue, trumpSuit, level, isLastTrick, hand);
                         if (grabCard) {
                             const label = grabCard.rank === level ? '级牌' : '大主牌';
-                            this._debug(`三家：队友首次出小主牌，无王，用${label}抢权`);
+                            this._debug(`三家：庄家队友未拿权，无王，用${label}抢权`);
                             return [grabCard];
                         }
-                        this._debug(`三家：队友首次出小主牌，争不过，跟最小主牌`);
+                        this._debug(`三家：庄家队友未拿权，争不过，跟最小主牌`);
                         return [trumps[0]];
                     }
 
-                    // ★ 第二次开始出小主牌：仅需拦截思路，确保对手方不跑分
-                    // 用户策略："首家队友第二次开始出小单主牌，仅需用拦截的思路确保对手方不跑分即可"
+                    // ★ 庄家队友已拿到过出牌权 → 仅需拦截思路，确保对手方不跑分
+                    // 用户策略："庄家队友拿到过出牌权了的话，拦截即可"
                     // 不再浪费大小王，用级牌/中级主牌拦截即可
                     const interceptCard = this._findTrumpInterceptCard(
                         trumps, winnerValue, trumpSuit, level, isLastTrick, hand);
                     if (interceptCard) {
-                        this._debug(`三家：队友后续出小主牌，拦截防跑分`);
+                        this._debug(`三家：庄家队友已拿权，拦截防跑分`);
                         return [interceptCard];
                     }
                     // 拦截不了 → 跟最小主牌
-                    this._debug(`三家：队友后续出小主牌，拦不住，跟最小主牌`);
+                    this._debug(`三家：庄家队友已拿权，拦不住，跟最小主牌`);
                     return [trumps[0]];
                 }
 
@@ -2738,8 +2815,16 @@ class TractorAI {
             // ================================================================
             // 四家（position=4）：决定胜负，出牌权争夺最关键
             // AI文档："本轮走牌要在自己这里分出胜负，自己的决策就十分重要"
+            //
+            // 特殊规则：庄家队友从未拿到出牌权时，四家（对手方）竭尽全力阻止
+            // 庄家队友得逞——即使用大王也在所不惜。
+            // 因为庄家队友手里还有强势牌没走，拿到出牌权意义重大。
             // ================================================================
             if (position === 4) {
+                // 判断当前赢家是否是庄家的队友
+                const dealerTeammate = this._getDealerTeammate(dealer);
+                const dealerTeammateWinning = dealerTeammate && winner.player === dealerTeammate;
+
                 if (winnerIsTeammate) {
                     // 队友赢 → 跑分
                     const runCard = this._getRunScoreCard(trumps);
@@ -2756,6 +2841,12 @@ class TractorAI {
                         // 尾盘非最后一轮保留大王（底牌>5分时才需要保底留大王）
                         if (!isLastTrick && this._isEndGame(hand) &&
                             trump.isJoker && trump.rank === 'big' && !this._shouldSkipBottomProtection()) {
+                            // 例外：庄家队友从未拿到出牌权且正在赢 → 不惜用大王阻止
+                            // 用户策略："四家也竭尽全力不让三家得逞，即使用大王也在所不惜"
+                            if (!this.memory.dealerTeammateHasLed && dealerTeammateWinning) {
+                                this._debug(`四家：庄家队友未拿权且正在赢，不惜用大王阻止`);
+                                return [trump];
+                            }
                             continue;
                         }
                         this._debug(`四家：对手赢，抢权`);
@@ -4412,6 +4503,22 @@ class TractorAI {
 
         const tractors = this._findTractorsFromPairs(pairs, trumpSuit, level);
         if (tractors.length > 0) return tractors[0];
+        return null;
+    }
+
+    /**
+     * 查找手牌中的副牌拖拉机（非主牌花色的连对）
+     * 用于二家大王抢权后强制走拖拉机的场景
+     * @returns {Array|null} 拖拉机牌数组，或null
+     */
+    _findSideTractor(hand, trumpSuit, level) {
+        for (const suit of [SUITS.SPADES, SUITS.HEARTS, SUITS.CLUBS, SUITS.DIAMONDS]) {
+            const suitCards = hand.filter(c =>
+                !c.isJoker && c.suit === suit && !isTrump(c, trumpSuit, level)
+            );
+            const tractor = this._findBestTractor(suitCards, trumpSuit, level);
+            if (tractor && tractor.length >= 4) return tractor;
+        }
         return null;
     }
 

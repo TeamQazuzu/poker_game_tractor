@@ -70,11 +70,19 @@ function initElements() {
     };
 }
 
-// 日志
+// 日志：花色符号着色（红♥♦ / 白♠♣，适配深色日志背景）
+function colorizeLogText(text) {
+    return text
+        .replace(/♥/g, '<span style="color: #ff5252;">♥</span>')
+        .replace(/♦/g, '<span style="color: #ff5252;">♦</span>')
+        .replace(/♠/g, '<span style="color: #e0e0e0;">♠</span>')
+        .replace(/♣/g, '<span style="color: #e0e0e0;">♣</span>');
+}
+
 function log(message) {
     const entry = document.createElement('div');
     entry.className = 'log-entry';
-    entry.textContent = `${new Date().toLocaleTimeString()} ${message}`;
+    entry.innerHTML = `${new Date().toLocaleTimeString()} ${colorizeLogText(message)}`;
     elements.logContent.appendChild(entry);
     elements.logContent.scrollTop = elements.logContent.scrollHeight;
 }
@@ -82,8 +90,15 @@ function log(message) {
 // 更新信息栏
 function updateInfo() {
     elements.currentLevel.textContent = `当前打: ${game.level}`;
-    elements.trumpSuit.textContent = `主花色: ${game.trumpSuit ? SUIT_SYMBOLS[game.trumpSuit] : '无'}`;
-    
+    // 主花色：直接用原始图案，红桃/方片红色，黑桃/梅花黑色
+    if (game.trumpSuit) {
+        const isRed = game.trumpSuit === SUITS.HEARTS || game.trumpSuit === SUITS.DIAMONDS;
+        const suitColor = isRed ? '#d32f2f' : '#1a1a1a';
+        elements.trumpSuit.innerHTML = `主花色: <span class="suit-symbol" style="color: ${suitColor}; font-size: 1.2em;">${SUIT_SYMBOLS[game.trumpSuit]}</span>`;
+    } else {
+        elements.trumpSuit.textContent = `主花色: 无`;
+    }
+
     const dealerNames = {
         bottom: '你',
         left: 'AI-左',
@@ -91,7 +106,15 @@ function updateInfo() {
         right: 'AI-右'
     };
     elements.currentDealer.textContent = `庄家: ${game.dealer ? dealerNames[game.dealer] : '--'}`;
-    elements.scoreInfo.textContent = `得分: ${game.trickScores.teamA} / 200`;
+    // 记分牌：只显示闲家（非庄家方）所得分数，80分为上台门槛
+    if (game.dealer) {
+        const dealerTeam = TEAMS.TEAM_A.includes(game.dealer) ? 'teamA' : 'teamB';
+        const attackerTeam = dealerTeam === 'teamA' ? 'teamB' : 'teamA';
+        const attackerScore = game.trickScores[attackerTeam];
+        elements.scoreInfo.textContent = `闲家得分: ${attackerScore} / 80`;
+    } else {
+        elements.scoreInfo.textContent = `闲家得分: 0 / 80`;
+    }
     
     elements.teamA.textContent = `我方: ${game.teamLevels.teamA}`;
     elements.teamB.textContent = `对方: ${game.teamLevels.teamB}`;
@@ -151,7 +174,7 @@ function updateTrumpBadges() {
             const isRed = game.trumpSuit === SUITS.HEARTS || game.trumpSuit === SUITS.DIAMONDS;
             const colorStyle = game.trumpSuit === null ? '' :
                 (isRed ? 'color: #d32f2f;' : 'color: #1a1a1a;');
-            badge.innerHTML = `亮主 <span style="${colorStyle}">${trumpDisplay}</span>`;
+            badge.innerHTML = `亮主 <span class="suit-symbol" style="${colorStyle}">${trumpDisplay}</span>`;
             badge.classList.add('show');
         }
     }
@@ -180,12 +203,12 @@ function createCardElement(card, selectable = false, onClick = null, isMandatory
         cardEl.innerHTML = `
             <div class="card-top-left">
                 <span class="card-rank">${display.rank}</span>
-                <span class="card-suit">${display.suit}</span>
+                <span class="card-suit card-suit-corner">${display.suit}</span>
             </div>
             <div class="card-center">${display.suit}</div>
             <div class="card-bottom-right">
                 <span class="card-rank">${display.rank}</span>
-                <span class="card-suit">${display.suit}</span>
+                <span class="card-suit card-suit-corner">${display.suit}</span>
             </div>
         `;
     }
@@ -1089,8 +1112,8 @@ function getPlayOrder() {
 
 // 处理出牌
 function processPlay(order, index) {
-    // 检查是否一局结束
-    if (game.players.bottom.length === 0) {
+    // 检查是否一局结束：仅在新一轮开始时（当前轮已打完）才检查
+    if (game.currentTrick.length === 0 && game.players.bottom.length === 0) {
         endRound();
         return;
     }
@@ -1618,12 +1641,56 @@ function hasSatisfiedMandatory(selected, mandatoryIds, leadPatternType, trumpSui
     return true;
 }
 
+// ===== 全屏切换 =====
+function toggleFullscreen() {
+    const doc = document;
+    const docEl = doc.documentElement;
+    const isFullscreen = doc.fullscreenElement || doc.webkitFullscreenElement;
+
+    if (!isFullscreen) {
+        // 进入全屏
+        if (docEl.requestFullscreen) {
+            docEl.requestFullscreen();
+        } else if (docEl.webkitRequestFullscreen) {
+            docEl.webkitRequestFullscreen();
+        } else if (docEl.webkitEnterFullscreen) {
+            // iOS Safari (Limited support)
+            docEl.webkitEnterFullscreen();
+        }
+    } else {
+        // 退出全屏
+        if (doc.exitFullscreen) {
+            doc.exitFullscreen();
+        } else if (doc.webkitExitFullscreen) {
+            doc.webkitExitFullscreen();
+        }
+    }
+}
+
+// 监听全屏状态变化，更新按钮文字
+function onFullscreenChange() {
+    const btn = document.getElementById('fullscreen-btn');
+    if (!btn) return;
+    const isFullscreen = document.fullscreenElement || document.webkitFullscreenElement;
+    btn.textContent = isFullscreen ? '退出全屏' : '全屏游玩';
+}
+
 // 初始化
 function init() {
     initElements();
     
     elements.startGame.addEventListener('click', startGame);
     elements.nextGame.addEventListener('click', nextGame);
+    
+    // 全屏按钮
+    const fullscreenBtn = document.getElementById('fullscreen-btn');
+    if (fullscreenBtn) {
+        fullscreenBtn.addEventListener('click', toggleFullscreen);
+    }
+    
+    // 监听全屏状态变化
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
     
     // 键盘快捷键
     document.addEventListener('keydown', (e) => {
